@@ -21,8 +21,8 @@ ENV NODE_ENV=production \
     STANDALONE_MODE=true \
     HOST=0.0.0.0
 
-RUN mkdir /backend/frontend-build && \
-    cp -r /frontend/dist/. /backend/frontend-build/
+RUN mkdir /backend/frontend-build
+RUN cp -r /frontend/dist/. /backend/frontend-build/
 
 WORKDIR /backend
 
