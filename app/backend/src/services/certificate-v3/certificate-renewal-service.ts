@@ -1,0 +1,2163 @@
+import { ForbiddenError, subject } from "@casl/ability";
+import { randomUUID } from "crypto";
+import { Knex } from "knex";
+
+import { ActionProjectType, TCertificates } from "@app/db/schemas";
+import { TLicenseService } from "@app/domains/platform/license/ce/module";
+import { TPermissionServiceFactory } from "@app/ee/services/permission/permission-service-types";
+import {
+  ProjectPermissionCertificateProfileActions,
+  ProjectPermissionSub
+} from "@app/ee/services/permission/project-permission";
+import { CertificateSource } from "@app/ee/services/pki-discovery/pki-discovery-types";
+import { isPqcAlgorithm } from "@app/lib/crypto/pqc/pqc-utils";
+import { BadRequestError, ForbiddenRequestError, NotFoundError } from "@app/lib/errors";
+import { logger } from "@app/lib/logger";
+import { ms } from "@app/lib/ms";
+import { TApprovalPolicyDALFactory } from "@app/services/approval-policy/approval-policy-dal";
+import { TApprovalPolicyServiceFactory } from "@app/services/approval-policy/approval-policy-service";
+import { TCertRequestRequestData } from "@app/services/approval-policy/cert-request/cert-request-policy-types";
+import { ActorAuthMethod, ActorType } from "@app/services/auth/auth-type";
+import {
+  TCertificateAuthorityDALFactory,
+  TCertificateAuthorityWithAssociatedCa
+} from "@app/services/certificate-authority/certificate-authority-dal";
+import { CaCapability, CaType } from "@app/services/certificate-authority/certificate-authority-enums";
+import { assertCaInProfileProject } from "@app/services/certificate-authority/certificate-authority-fns";
+import {
+  caIssuesFromCsr,
+  caSupportsCapability,
+  CERTIFICATE_AUTHORITIES_TYPE_MAP
+} from "@app/services/certificate-authority/certificate-authority-maps";
+import { TInternalCertificateAuthorityServiceFactory } from "@app/services/certificate-authority/internal/internal-certificate-authority-service";
+import {
+  TProfileCustomExtension,
+  TResolvedCustomExtension
+} from "@app/services/certificate-common/certificate-extension-fns";
+import { TCertificatePolicyServiceFactory } from "@app/services/certificate-policy/certificate-policy-service";
+import { TCertificateProfileDALFactory } from "@app/services/certificate-profile/certificate-profile-dal";
+import {
+  EnrollmentType,
+  IssuerType,
+  TCertificateProfileWithConfigs
+} from "@app/services/certificate-profile/certificate-profile-types";
+import {
+  CertificateApplicationAlertEvent,
+  TCertificateAlertEventEmitter
+} from "@app/services/certificate/certificate-alert-events";
+import { TCertificateBodyDALFactory } from "@app/services/certificate/certificate-body-dal";
+import { TCertificateDALFactory, TOriginatingCertificateRequest } from "@app/services/certificate/certificate-dal";
+import { assertCertificateNotDeleted } from "@app/services/certificate/certificate-fns";
+import { TCertificateSecretDALFactory } from "@app/services/certificate/certificate-secret-dal";
+import { CertKeyAlgorithm, CertSignatureAlgorithm, CertStatus } from "@app/services/certificate/certificate-types";
+import { TApiEnrollmentConfigDALFactory } from "@app/services/enrollment-config/api-enrollment-config-dal";
+import { TKmsServiceFactory } from "@app/services/kms/kms-service";
+import { TPkiAlertV2QueueServiceFactory } from "@app/services/pki-alert-v2/pki-alert-v2-queue";
+import { PkiAlertEventType } from "@app/services/pki-alert-v2/pki-alert-v2-types";
+import { TProjectDALFactory } from "@app/services/project/project-dal";
+import { getProjectKmsCertificateKeyId } from "@app/services/project/project-fns";
+
+import { TCertificateIssuanceQueueFactory } from "../certificate-authority/certificate-issuance-queue";
+import {
+  CertificateIssuanceOperation,
+  CertSubjectAlternativeNameType,
+  mapExtendedKeyUsageToLegacy,
+  mapKeyUsageToLegacy
+} from "../certificate-common/certificate-constants";
+import {
+  detectSanType,
+  extractCertificateFromBuffer,
+  getEffectiveAlgorithms,
+  isValidRenewalTiming,
+  resolveEffectiveApiConfig,
+  resolveRenewedCertificateRenewBeforeDays,
+  validateAlgorithmCompatibility,
+  validateCaSupport
+} from "../certificate-common/certificate-issuance-utils";
+import {
+  assertCanEditCertificate,
+  assertCanEditCertificateResult,
+  assertCanRevokeCertificate
+} from "../certificate-common/certificate-permission-fns";
+import { TCertificateQuotaDeps } from "../certificate-common/certificate-quota-fns";
+import { buildCertificateQuotaKey } from "../certificate-common/certificate-quota-key";
+import {
+  convertExtendedKeyUsageArrayToLegacy,
+  convertKeyUsageArrayToLegacy,
+  normalizeDateForApi,
+  removeRootCaFromChain,
+  validateCertificateRequestLicense,
+  validatePqcLicense
+} from "../certificate-common/certificate-utils";
+import { CertificateReissueMap } from "../certificate-common/external-metadata-schemas";
+import { TCertificateRequest } from "../certificate-policy/certificate-policy-types";
+import {
+  holdCertificateRequestForApproval,
+  matchCertificateRequestApprovalPolicy,
+  TCertificateRequestApprovalPolicy
+} from "../certificate-request/certificate-request-approval-fns";
+import { TCertificateRequestDALFactory } from "../certificate-request/certificate-request-dal";
+import {
+  attachCertificateToPendingRequest,
+  markPendingRequestFailed
+} from "../certificate-request/certificate-request-fns";
+import { TCertificateRequestServiceFactory } from "../certificate-request/certificate-request-service";
+import { CertificateRequestStatus } from "../certificate-request/certificate-request-types";
+import { TCertificateSyncDALFactory } from "../certificate-sync/certificate-sync-dal";
+import { TPkiApplicationDALFactory } from "../pki-application/pki-application-dal";
+import { TPkiApplicationProfileDALFactory } from "../pki-application/pki-application-profile-dal";
+import { TPkiSyncDALFactory } from "../pki-sync/pki-sync-dal";
+import { TPkiSyncQueueFactory } from "../pki-sync/pki-sync-queue";
+import {
+  addRenewedCertificateToSyncs,
+  queueCertificateFilterReconcile,
+  triggerAutoSyncForCertificate
+} from "../pki-sync/pki-sync-utils";
+import { TResourceMetadataDALFactory } from "../resource-metadata/resource-metadata-dal";
+import { copyMetadataFromCertificate } from "../resource-metadata/resource-metadata-fns";
+import {
+  assertCsrRenewalAttributes,
+  buildCsrFromExistingKey,
+  buildCsrRenewalCertificateRequest,
+  buildRenewalApprovalSnapshot,
+  buildRenewalAuditChanges,
+  buildRenewalCertificateRequest,
+  buildRenewalDistinguishedName,
+  buildRenewalPreview,
+  CertificateRenewalMode,
+  certificateSpanToTtl,
+  haveDifferentCustomExtensions,
+  haveDifferentSubjectAlternativeNames,
+  importKeyPairFromPem,
+  isCertificateContentEdit,
+  isSameRenewalApprovalSnapshot,
+  keepCertificateFactsInCsrRenewal,
+  resolveRenewalAlgorithms,
+  resolveRenewalAltNames,
+  resolveRenewalCustomExtensions,
+  resolveRenewalKeySource,
+  resolveRenewalSubject,
+  resolveRenewalUsages,
+  validateRenewalEligibility
+} from "./certificate-renewal-fns";
+import { processSelfSignedCertificate } from "./certificate-self-signed-fns";
+import {
+  CertificateRenewalKeySource,
+  TCertificateIssuanceResponse,
+  TDisableRenewalConfigDTO,
+  TDisableRenewalResponse,
+  TRenewalAttributes,
+  TRenewalAuditChange,
+  TRenewalConfigResponse,
+  TRenewCertificateDTO,
+  TUpdateRenewalConfigDTO
+} from "./certificate-v3-types";
+
+type TCertificateRenewalServiceFactoryDep = {
+  certificateDAL: Pick<
+    TCertificateDALFactory,
+    | "findById"
+    | "findByIdForUpdate"
+    | "updateById"
+    | "transaction"
+    | "create"
+    | "getRequestEnrollmentTypeByCertId"
+    | "getOriginatingRequestByCertId"
+    | "hasRenewalAwaitingApproval"
+    | "canRenewFromCsr"
+  >;
+  certificateBodyDAL: Pick<TCertificateBodyDALFactory, "create" | "findOne">;
+  certificateSecretDAL: Pick<TCertificateSecretDALFactory, "findOne" | "create">;
+  certificateAuthorityDAL: Pick<TCertificateAuthorityDALFactory, "findByIdWithAssociatedCa">;
+  certificateProfileDAL: Pick<TCertificateProfileDALFactory, "findByIdWithConfigs">;
+  certificatePolicyService: Pick<TCertificatePolicyServiceFactory, "validateRequestAgainstPolicy" | "getPolicyById">;
+  internalCaService: Pick<TInternalCertificateAuthorityServiceFactory, "signCertFromCa" | "issueCertFromCa">;
+  permissionService: Pick<TPermissionServiceFactory, "getProjectPermission" | "getResourcePermission">;
+  certificateSyncDAL: Pick<
+    TCertificateSyncDALFactory,
+    | "findPkiSyncIdsByCertificateId"
+    | "addCertificates"
+    | "findByPkiSyncAndCertificate"
+    | "updateSyncMetadata"
+    | "primaryNode"
+  >;
+  pkiSyncDAL: Pick<TPkiSyncDALFactory, "find">;
+  pkiSyncQueue: Pick<TPkiSyncQueueFactory, "queuePkiSyncSyncCertificatesById" | "queuePkiSyncLinkMatchingCertificates">;
+  kmsService: Pick<TKmsServiceFactory, "generateKmsKey" | "encryptWithKmsKey" | "decryptWithKmsKey">;
+  projectDAL: TProjectDALFactory;
+  certificateIssuanceQueue: Pick<TCertificateIssuanceQueueFactory, "queueCertificateIssuance">;
+  certificateRequestService: Pick<TCertificateRequestServiceFactory, "createCertificateRequest">;
+  certificateRequestDAL: Pick<
+    TCertificateRequestDALFactory,
+    "attachCertificate" | "transitionFromPending" | "updateById"
+  >;
+  resourceMetadataDAL: Pick<TResourceMetadataDALFactory, "insertMany" | "delete" | "find">;
+  pkiAlertV2Queue?: Pick<TPkiAlertV2QueueServiceFactory, "queueCertificateEvent">;
+  certificateAlertEventEmitter: Pick<TCertificateAlertEventEmitter, "emit">;
+  pkiApplicationDAL: Pick<TPkiApplicationDALFactory, "findById">;
+  pkiApplicationProfileDAL: Pick<
+    TPkiApplicationProfileDALFactory,
+    "findAllByProfileId" | "findOneByApplicationAndProfile"
+  >;
+  apiEnrollmentConfigDAL: Pick<TApiEnrollmentConfigDALFactory, "findById">;
+  licenseService: TLicenseService;
+  quotaDeps: TCertificateQuotaDeps;
+  recordQuotaUsage: (usage?: { orgId: string; isNewQuotaKey: boolean; isWildcard: boolean }) => Promise<void>;
+  resolveApplicationIdForProfile: TResolveApplicationIdForProfile;
+  reportCertificateIssued: TReportCertificateIssued;
+  resolveRequesterInfo: TResolveRequesterInfo;
+  approvalPolicyService: Pick<TApprovalPolicyServiceFactory, "matchPolicy" | "createRequestFromPolicy">;
+  approvalPolicyDAL: Pick<TApprovalPolicyDALFactory, "findStepsByPolicyId">;
+};
+
+const MAX_RENEWAL_CHAIN_HOPS = 10;
+
+const isSourcedOutsideInfisical = (certificate: TCertificates) =>
+  Boolean(certificate.source) && certificate.source !== CertificateSource.Issued;
+
+class RenewalBlockedError extends BadRequestError {
+  readonly renewalError: string;
+
+  constructor(renewalError: string) {
+    super({ message: renewalError });
+    this.renewalError = renewalError;
+  }
+}
+
+type TRenewalActor = {
+  actor: ActorType;
+  actorId: string;
+  actorAuthMethod: ActorAuthMethod;
+  actorOrgId: string;
+};
+
+export type TResolveApplicationIdForProfile = (
+  profile: { id: string; projectId: string; slug: string },
+  explicitApplicationId: string | undefined,
+  actorCtx: { actor: ActorType; actorId: string; actorAuthMethod: ActorAuthMethod; actorOrgId: string },
+  enrollmentType: EnrollmentType
+) => Promise<string | undefined>;
+
+export type TReportCertificateIssued = (args: {
+  orgId: string;
+  projectId: string;
+  profileId?: string;
+  applicationId?: string;
+  enrollmentType: EnrollmentType;
+  operation: CertificateIssuanceOperation;
+  actor: ActorType;
+  actorId: string;
+}) => Promise<void>;
+
+export type TResolveRequesterInfo = (
+  actor: ActorType,
+  actorId: string,
+  enrollmentType: EnrollmentType
+) => Promise<{ requesterName: string; requesterEmail: string }>;
+
+export type TCertificateRenewalServiceFactory = ReturnType<typeof certificateRenewalServiceFactory>;
+
+export const certificateRenewalServiceFactory = ({
+  certificateDAL,
+  certificateBodyDAL,
+  certificateSecretDAL,
+  certificateAuthorityDAL,
+  certificateProfileDAL,
+  certificatePolicyService,
+  internalCaService,
+  permissionService,
+  certificateSyncDAL,
+  pkiSyncDAL,
+  pkiSyncQueue,
+  kmsService,
+  projectDAL,
+  certificateIssuanceQueue,
+  certificateRequestService,
+  certificateRequestDAL,
+  resourceMetadataDAL,
+  pkiAlertV2Queue,
+  certificateAlertEventEmitter,
+  pkiApplicationDAL,
+  pkiApplicationProfileDAL,
+  apiEnrollmentConfigDAL,
+  licenseService,
+  quotaDeps,
+  recordQuotaUsage,
+  resolveApplicationIdForProfile: $resolveApplicationIdForProfile,
+  reportCertificateIssued: $reportCertificateIssued,
+  resolveRequesterInfo: $resolveRequesterInfo,
+  approvalPolicyService,
+  approvalPolicyDAL
+}: TCertificateRenewalServiceFactoryDep) => {
+  const $openRenewalRequest = async (
+    request: Parameters<TCertificateRequestServiceFactory["createCertificateRequest"]>[0],
+    approvedCertificateRequestId?: string
+  ) => {
+    if (!approvedCertificateRequestId) return certificateRequestService.createCertificateRequest(request);
+
+    const { status, certificateId, csr, notBefore, notAfter, tx } = request;
+    return certificateRequestDAL.updateById(
+      approvedCertificateRequestId,
+      { status, certificateId, notBefore, notAfter, ...(csr && { csr }) },
+      tx
+    );
+  };
+
+  const $linkRenewedCertificate = async (
+    {
+      newCert,
+      originalCert,
+      finalRenewBeforeDays,
+      isRenewalLinkPreset = false,
+      certificateRequestId,
+      certificateRequestCreatedAt,
+      isRequestMetadataCopied = false,
+      orgId
+    }: {
+      newCert: TCertificates;
+      originalCert: TCertificates;
+      finalRenewBeforeDays?: number;
+      isRenewalLinkPreset?: boolean;
+      certificateRequestId: string;
+      certificateRequestCreatedAt: Date;
+      isRequestMetadataCopied?: boolean;
+      orgId: string;
+    },
+    tx: Knex
+  ) => {
+    const lockedOriginalCert = await certificateDAL.findByIdForUpdate(originalCert.id, tx);
+    if (lockedOriginalCert) assertCertificateNotDeleted(lockedOriginalCert);
+
+    const renewalUpdate: {
+      profileId?: string | null;
+      renewedFromCertificateId?: string;
+      renewBeforeDays?: number;
+      applicationId?: string | null;
+      orderId?: string;
+    } = isRenewalLinkPreset
+      ? {}
+      : { profileId: originalCert.profileId || null, renewedFromCertificateId: originalCert.id };
+
+    if (originalCert.orderId) renewalUpdate.orderId = originalCert.orderId;
+
+    if (finalRenewBeforeDays !== undefined) renewalUpdate.renewBeforeDays = finalRenewBeforeDays;
+    if (originalCert.applicationId) renewalUpdate.applicationId = originalCert.applicationId;
+    if (Object.keys(renewalUpdate).length > 0) {
+      await certificateDAL.updateById(newCert.id, renewalUpdate, tx);
+    }
+
+    await certificateDAL.updateById(originalCert.id, { renewedByCertificateId: newCert.id, renewalError: null }, tx);
+    await addRenewedCertificateToSyncs(originalCert.id, newCert.id, { certificateSyncDAL }, tx);
+
+    await copyMetadataFromCertificate(resourceMetadataDAL, {
+      sourceCertificateId: originalCert.id,
+      targetCertificateId: newCert.id,
+      ...(!isRequestMetadataCopied && {
+        targetCertificateRequestId: certificateRequestId,
+        targetCertificateRequestCreatedAt: certificateRequestCreatedAt
+      }),
+      orgId,
+      tx
+    });
+
+    await certificateAlertEventEmitter.emit(
+      {
+        certificateId: newCert.id,
+        projectId: originalCert.projectId,
+        orgId,
+        eventType: CertificateApplicationAlertEvent.Renewal,
+        applicationId: originalCert.applicationId ?? null
+      },
+      tx
+    );
+  };
+
+  const $finalizeRenewal = async ({
+    newCertificateId,
+    originalCert,
+    profile,
+    certificate,
+    issuingCaCertificate,
+    certificateChain,
+    serialNumber,
+    certificateRequestId,
+    commonName,
+    fallbackProfileName,
+    removeRootsFromChain,
+    actor,
+    actorId,
+    actorOrgId
+  }: {
+    newCertificateId: string;
+    originalCert: TCertificates;
+    profile: { slug?: string | null; project?: { orgId?: string } | null } | null;
+    certificate: string;
+    issuingCaCertificate: string;
+    certificateChain: string;
+    serialNumber: string;
+    certificateRequestId: string;
+    commonName: string;
+    fallbackProfileName: string;
+    removeRootsFromChain?: boolean;
+    actor: ActorType;
+    actorId: string;
+    actorOrgId: string;
+  }): Promise<TCertificateIssuanceResponse> => {
+    await triggerAutoSyncForCertificate(newCertificateId, { certificateSyncDAL, pkiSyncDAL, pkiSyncQueue });
+
+    if (originalCert.applicationId) {
+      await queueCertificateFilterReconcile(newCertificateId, originalCert.applicationId, pkiSyncQueue);
+      await queueCertificateFilterReconcile(originalCert.id, originalCert.applicationId, pkiSyncQueue);
+    }
+
+    try {
+      await pkiAlertV2Queue?.queueCertificateEvent({
+        certificateId: newCertificateId,
+        projectId: originalCert.projectId,
+        eventType: PkiAlertEventType.RENEWAL,
+        applicationId: originalCert.applicationId ?? null
+      });
+    } catch {
+      logger.debug("Failed to queue PKI renewal alert event");
+    }
+
+    await $reportCertificateIssued({
+      orgId: profile?.project?.orgId ?? actorOrgId,
+      projectId: originalCert.projectId,
+      profileId: originalCert.profileId ?? undefined,
+      applicationId: originalCert.applicationId ?? undefined,
+      enrollmentType: EnrollmentType.API,
+      operation: CertificateIssuanceOperation.RENEW,
+      actor,
+      actorId
+    });
+
+    return {
+      status: CertificateRequestStatus.ISSUED,
+      certificate,
+      issuingCaCertificate,
+      certificateChain: removeRootsFromChain ? removeRootCaFromChain(certificateChain) : certificateChain,
+      serialNumber,
+      certificateId: newCertificateId,
+      certificateRequestId,
+      projectId: originalCert.projectId,
+      profileName: profile?.slug || fallbackProfileName,
+      commonName
+    };
+  };
+
+  const $decryptCertificatePrivateKey = async ({
+    projectId,
+    encryptedPrivateKey
+  }: {
+    projectId: string;
+    encryptedPrivateKey: Buffer;
+  }): Promise<string> => {
+    const certificateManagerKmsId = await getProjectKmsCertificateKeyId({ projectId, projectDAL, kmsService });
+    const kmsDecryptor = await kmsService.decryptWithKmsKey({ kmsId: certificateManagerKmsId });
+    const decryptedPrivateKey = await kmsDecryptor({ cipherTextBlob: encryptedPrivateKey });
+    return decryptedPrivateKey.toString("utf-8");
+  };
+
+  const $completeKeyPreservingRenewal = async ({
+    keySource,
+    csr,
+    ca,
+    profile,
+    policy,
+    originalCert,
+    certificateRequest,
+    certificateSecret,
+    ttl,
+    notBefore,
+    notAfter,
+    finalRenewBeforeDays,
+    effectiveKeyAlgorithm,
+    effectiveSignatureAlgorithm,
+    actor,
+    actorId,
+    actorAuthMethod,
+    actorOrgId,
+    removeRootsFromChain,
+    resolvedCustomExtensions,
+    approvedCertificateRequestId
+  }: {
+    keySource: CertificateRenewalKeySource;
+    csr?: string;
+    ca: TCertificateAuthorityWithAssociatedCa;
+    profile: Awaited<ReturnType<TCertificateProfileDALFactory["findByIdWithConfigs"]>> | null;
+    policy: Awaited<ReturnType<TCertificatePolicyServiceFactory["getPolicyById"]>> | null;
+    originalCert: TCertificates;
+    certificateRequest: TCertificateRequest;
+    certificateSecret: { encryptedPrivateKey: Buffer } | undefined;
+    ttl: string;
+    notBefore: Date;
+    notAfter: Date;
+    finalRenewBeforeDays: number | undefined;
+    effectiveKeyAlgorithm: CertKeyAlgorithm;
+    effectiveSignatureAlgorithm: CertSignatureAlgorithm;
+    actor: ActorType;
+    actorId: string;
+    actorAuthMethod: ActorAuthMethod;
+    actorOrgId: string;
+    removeRootsFromChain?: boolean;
+    resolvedCustomExtensions?: TResolvedCustomExtension[];
+    approvedCertificateRequestId?: string;
+  }): Promise<TCertificateIssuanceResponse> => {
+    const isCsrAuthoritative = keySource === CertificateRenewalKeySource.Csr;
+    const requestedAltNames = certificateRequest.subjectAlternativeNames ?? [];
+
+    let renewalCsr: string;
+    if (isCsrAuthoritative) {
+      renewalCsr = csr as string;
+    } else if (certificateSecret) {
+      renewalCsr = await buildCsrFromExistingKey({
+        privateKeyPem: await $decryptCertificatePrivateKey({
+          projectId: originalCert.projectId,
+          encryptedPrivateKey: certificateSecret.encryptedPrivateKey
+        }),
+        keyAlgorithm: effectiveKeyAlgorithm,
+        certificateRequest
+      });
+    } else {
+      throw new BadRequestError({
+        message:
+          "This certificate's key pair cannot be reused because Infisical holds neither its private key nor a signing request generated from it. Renew with a new key pair, or supply a CSR generated from the existing key."
+      });
+    }
+
+    const subjectOverride = buildRenewalDistinguishedName(certificateRequest);
+
+    const shouldIssueAsCA = certificateRequest.basicConstraints?.isCA === true;
+    const caBasicConstraints = shouldIssueAsCA
+      ? { isCA: true, pathLength: policy?.basicConstraints?.maxPathLength }
+      : undefined;
+
+    const pendingRequest = await $openRenewalRequest(
+      {
+        internal: true,
+        actor,
+        actorId,
+        actorAuthMethod,
+        actorOrgId,
+        projectId: originalCert.projectId,
+        caId: ca.id,
+        profileId: originalCert.profileId ?? undefined,
+        applicationId: originalCert.applicationId ?? undefined,
+        csr: renewalCsr,
+        commonName: certificateRequest.commonName,
+        altNames: requestedAltNames,
+        keyUsages: certificateRequest.keyUsages,
+        extendedKeyUsages: certificateRequest.extendedKeyUsages,
+        notBefore,
+        notAfter,
+        keyAlgorithm: effectiveKeyAlgorithm,
+        signatureAlgorithm: effectiveSignatureAlgorithm,
+        metadata: `Renewed from certificate ID: ${originalCert.id}`,
+        customExtensions: resolvedCustomExtensions,
+        status: CertificateRequestStatus.PENDING,
+        ttl,
+        enrollmentType: EnrollmentType.API,
+        organization: certificateRequest.organization,
+        organizationalUnit: certificateRequest.organizationalUnit,
+        country: certificateRequest.country,
+        state: certificateRequest.state,
+        locality: certificateRequest.locality,
+        domainComponents: certificateRequest.domainComponents,
+        ...(certificateRequest.basicConstraints && { basicConstraints: certificateRequest.basicConstraints })
+      },
+      approvedCertificateRequestId
+    );
+
+    let certResult: Awaited<ReturnType<typeof internalCaService.signCertFromCa>>;
+    try {
+      certResult = await internalCaService.signCertFromCa({
+        isInternal: true,
+        caId: ca.id,
+        csr: renewalCsr,
+        subjectOverride,
+        customExtensions: resolvedCustomExtensions,
+        commonName: certificateRequest.commonName,
+        altNames: isCsrAuthoritative ? undefined : requestedAltNames.map((san) => san.value).join(","),
+        basicConstraints: caBasicConstraints,
+        pathLength: certificateRequest.basicConstraints?.pathLength,
+        ttl,
+        notBefore: normalizeDateForApi(notBefore),
+        notAfter: normalizeDateForApi(notAfter),
+        keyUsages: convertKeyUsageArrayToLegacy(certificateRequest.keyUsages),
+        extendedKeyUsages: convertExtendedKeyUsageArrayToLegacy(certificateRequest.extendedKeyUsages),
+        signatureAlgorithm: effectiveSignatureAlgorithm,
+        keyAlgorithm: effectiveKeyAlgorithm,
+        isFromProfile: true,
+        onPersisted: async (newCert, tx) => {
+          if (keySource === CertificateRenewalKeySource.Reuse && certificateSecret) {
+            await certificateSecretDAL.create(
+              { certId: newCert.id, encryptedPrivateKey: certificateSecret.encryptedPrivateKey },
+              tx
+            );
+          }
+
+          await attachCertificateToPendingRequest(
+            certificateRequestDAL,
+            {
+              certificateRequestId: pendingRequest.id,
+              certificateId: newCert.id,
+              projectId: originalCert.projectId,
+              operation: CertificateIssuanceOperation.RENEW
+            },
+            tx
+          );
+
+          await $linkRenewedCertificate(
+            {
+              newCert,
+              originalCert,
+              finalRenewBeforeDays,
+              certificateRequestId: pendingRequest.id,
+              certificateRequestCreatedAt: pendingRequest.createdAt,
+              isRequestMetadataCopied: Boolean(approvedCertificateRequestId),
+              orgId: actorOrgId
+            },
+            tx
+          );
+        }
+      });
+    } catch (err) {
+      await markPendingRequestFailed(certificateRequestDAL, {
+        certificateRequestId: pendingRequest.id,
+        error: err,
+        fallbackMessage: "Certificate renewal failed"
+      });
+      throw err;
+    }
+
+    return $finalizeRenewal({
+      newCertificateId: certResult.certificateId,
+      originalCert,
+      profile: profile ?? null,
+      certificate: extractCertificateFromBuffer(certResult.certificate as unknown as Buffer),
+      issuingCaCertificate: extractCertificateFromBuffer(certResult.issuingCaCertificate as unknown as Buffer),
+      certificateChain: extractCertificateFromBuffer(certResult.certificateChain as unknown as Buffer),
+      serialNumber: certResult.serialNumber,
+      certificateRequestId: pendingRequest.id,
+      commonName: certResult.commonName || "",
+      fallbackProfileName: "Renewed Certificate",
+      removeRootsFromChain,
+      actor,
+      actorId,
+      actorOrgId
+    });
+  };
+
+  // The CSR a keyless certificate renews on its existing key pair from: the one its originating request
+  // carried, or the one supplied when it was imported (imports have no request row).
+  const $findStoredCsr = async (certificateId: string, originatingRequestCsr?: string | null) => {
+    const requestCsr =
+      originatingRequestCsr === undefined
+        ? (await certificateDAL.getOriginatingRequestByCertId(certificateId)).csr
+        : originatingRequestCsr;
+    if (requestCsr) return requestCsr;
+    const certificateBody = await certificateBodyDAL.findOne({ certId: certificateId });
+    return certificateBody?.importedCsr ?? null;
+  };
+
+  const $loadRenewalSubject = async (
+    { certificateId, keySource }: { certificateId: string; keySource: CertificateRenewalKeySource },
+    tx: Knex
+  ) => {
+    const originalCert = await certificateDAL.findByIdForUpdate(certificateId, tx);
+    if (!originalCert) {
+      throw new NotFoundError({ message: "Certificate not found" });
+    }
+
+    if (!originalCert.profileId) {
+      throw new ForbiddenRequestError({
+        message:
+          "This certificate is not linked to a certificate profile, so it cannot be renewed. The profile it was issued from may have been deleted."
+      });
+    }
+
+    const profile = await certificateProfileDAL.findByIdWithConfigs(originalCert.profileId, tx);
+    if (!profile) {
+      throw new NotFoundError({ message: "Certificate profile not found" });
+    }
+
+    const originatingRequest = await certificateDAL.getOriginatingRequestByCertId(originalCert.id, tx);
+    const { signatureAlgorithm: originalSignatureAlgorithm, keyAlgorithm: originalKeyAlgorithm } =
+      resolveRenewalAlgorithms(originatingRequest, originalCert);
+
+    const { enrollmentType } = originatingRequest;
+    if (enrollmentType && enrollmentType !== EnrollmentType.API) {
+      throw new ForbiddenRequestError({
+        message: `Certificate is not eligible for renewal: ${enrollmentType.toUpperCase()} certificates cannot be renewed`
+      });
+    }
+
+    const certificateSecret = await certificateSecretDAL.findOne({ certId: originalCert.id }, tx);
+
+    if (!originalCert.deletedAt && keySource === CertificateRenewalKeySource.Reuse && !certificateSecret) {
+      throw new BadRequestError({
+        message:
+          "This certificate's key pair cannot be reused because Infisical holds neither its private key nor a signing request generated from it. Renew with a new key pair, or for a CA-issued certificate supply a CSR generated from the existing key."
+      });
+    }
+
+    return {
+      originalCert,
+      profile,
+      certificateSecret,
+      originalSignatureAlgorithm,
+      originalKeyAlgorithm,
+      originatingRequest
+    };
+  };
+
+  const $authorizeRenewal = async (
+    {
+      originalCert,
+      profile,
+      actorCtx,
+      isEditingCertificate
+    }: {
+      originalCert: TCertificates;
+      profile: { id: string; projectId: string; slug: string };
+      actorCtx: TRenewalActor;
+      isEditingCertificate: boolean;
+    },
+    tx: Knex
+  ) => {
+    const { certMetadata, projectPermission } = isEditingCertificate
+      ? await assertCanEditCertificate({
+          certificate: originalCert,
+          ...actorCtx,
+          permissionService,
+          resourceMetadataDAL,
+          tx
+        })
+      : { certMetadata: [] as { key: string; value: string }[], projectPermission: undefined };
+
+    if (originalCert.applicationId) {
+      await $resolveApplicationIdForProfile(profile, originalCert.applicationId, actorCtx, EnrollmentType.API);
+      return { certMetadata, projectPermission };
+    }
+
+    const { permission } = await permissionService.getProjectPermission({
+      ...actorCtx,
+      projectId: profile.projectId,
+      actionProjectType: ActionProjectType.CertificateManager
+    });
+    ForbiddenError.from(permission).throwUnlessCan(
+      ProjectPermissionCertificateProfileActions.IssueCert,
+      subject(ProjectPermissionSub.CertificateProfiles, { slug: profile.slug })
+    );
+
+    return { certMetadata, projectPermission };
+  };
+
+  const $resolveRenewalIssuer = async (
+    {
+      originalCert,
+      profile,
+      actorCtx,
+      internal,
+      requestedTtl
+    }: {
+      originalCert: TCertificates;
+      profile: TCertificateProfileWithConfigs;
+      actorCtx: TRenewalActor;
+      internal: boolean;
+      requestedTtl?: string;
+    },
+    tx: Knex
+  ) => {
+    const issuerType = profile.issuerType || (originalCert.caId ? IssuerType.CA : IssuerType.SELF_SIGNED);
+
+    let ca: TCertificateAuthorityWithAssociatedCa | undefined;
+    let caType: CaType | undefined;
+    if (issuerType === IssuerType.CA) {
+      const caId = profile.caId || originalCert.caId;
+      if (!caId) {
+        throw new NotFoundError({ message: "Certificate Authority ID not found" });
+      }
+
+      ca = await certificateAuthorityDAL.findByIdWithAssociatedCa(caId, tx);
+      if (!ca) {
+        throw new NotFoundError({ message: "Certificate Authority not found" });
+      }
+
+      assertCaInProfileProject(ca, profile);
+
+      const eligibilityCheck = validateRenewalEligibility(originalCert, ca, requestedTtl);
+      if (!eligibilityCheck.isEligible) {
+        throw new RenewalBlockedError(`Certificate is not eligible for renewal: ${eligibilityCheck.errors.join(", ")}`);
+      }
+
+      caType = (ca.externalCa?.type as CaType) ?? CaType.INTERNAL;
+      if (caType === CaType.INTERNAL) {
+        validateCaSupport(ca, "direct certificate issuance");
+      }
+    }
+
+    const policyId = profile.certificatePolicyId || originalCert.certificateTemplateId;
+    const policy = policyId ? await certificatePolicyService.getPolicyById({ ...actorCtx, policyId, internal }) : null;
+
+    if (!policy) {
+      throw new NotFoundError({ message: "Certificate policy not found for this profile" });
+    }
+
+    return { issuerType, ca, caType, policy };
+  };
+
+  const $buildValidatedRenewalRequest = ({
+    originalCert,
+    policy,
+    csrRenewalRequest,
+    issuedFrom,
+    attributes,
+    keySource,
+    originalSignatureAlgorithm,
+    originalKeyAlgorithm,
+    profileCustomExtensions,
+    maxTtlDays
+  }: {
+    originalCert: TCertificates;
+    policy: Parameters<TCertificatePolicyServiceFactory["validateRequestAgainstPolicy"]>[0];
+    csrRenewalRequest: TCertificateRequest | null;
+    issuedFrom: TOriginatingCertificateRequest;
+    attributes?: TRenewCertificateDTO["attributes"];
+    keySource: CertificateRenewalKeySource;
+    originalSignatureAlgorithm?: CertSignatureAlgorithm;
+    originalKeyAlgorithm?: CertKeyAlgorithm;
+    profileCustomExtensions?: TProfileCustomExtension[] | null;
+    maxTtlDays?: number;
+  }) => {
+    const originalTtl = certificateSpanToTtl(originalCert.notBefore, originalCert.notAfter);
+
+    const carriedCustomExtensions = resolveRenewalCustomExtensions(issuedFrom, originalCert);
+
+    const requested = issuedFrom.exists ? issuedFrom : null;
+
+    const requestedAltNames = resolveRenewalAltNames(issuedFrom, originalCert.altNames);
+
+    const originalRequest: TCertificateRequest = {
+      commonName: requested?.commonName || originalCert.commonName || undefined,
+      ...resolveRenewalSubject(issuedFrom, originalCert),
+      ...resolveRenewalUsages(issuedFrom, originalCert),
+      subjectAlternativeNames: requestedAltNames,
+      validity: { ttl: originalTtl },
+      signatureAlgorithm: originalSignatureAlgorithm,
+      keyAlgorithm: originalKeyAlgorithm,
+      customExtensions: carriedCustomExtensions,
+      ...(originalCert.isCA && {
+        basicConstraints: { isCA: true, pathLength: originalCert.pathLength ?? undefined }
+      })
+    };
+
+    const mergedRequest = csrRenewalRequest
+      ? {
+          ...keepCertificateFactsInCsrRenewal(csrRenewalRequest, originalRequest),
+          customExtensions:
+            attributes?.customExtensions ?? csrRenewalRequest.customExtensions ?? carriedCustomExtensions
+        }
+      : buildRenewalCertificateRequest({ original: originalRequest, attributes });
+
+    if (
+      keySource === CertificateRenewalKeySource.Reuse &&
+      attributes?.keyAlgorithm &&
+      attributes.keyAlgorithm !== originalCert.keyAlgorithm
+    ) {
+      throw new BadRequestError({
+        message: `The key algorithm cannot be changed to '${attributes.keyAlgorithm}' while reusing the existing key pair, which is '${originalCert.keyAlgorithm}'. Renew with a new key pair to change it.`
+      });
+    }
+
+    const requestedTtl = mergedRequest.validity?.ttl || originalTtl;
+    const ttl = maxTtlDays && ms(requestedTtl) > ms(`${maxTtlDays}d`) ? `${maxTtlDays}d` : requestedTtl;
+    const certificateRequest = { ...mergedRequest, validity: { ttl } };
+
+    const validationResult = certificatePolicyService.validateRequestAgainstPolicy(policy, certificateRequest, {
+      profileCustomExtensions
+    });
+    if (!validationResult.isValid) {
+      throw new RenewalBlockedError(`Certificate renewal failed. Errors: ${validationResult.errors.join(", ")}`);
+    }
+
+    return {
+      certificateRequest,
+      replayedRequest: originalRequest,
+      ttl,
+      resolvedCustomExtensions: validationResult.resolvedCustomExtensions
+    };
+  };
+
+  const $assertKeySourceSupported = ({
+    keySource,
+    issuerType,
+    caType,
+    hasStoredKey
+  }: {
+    keySource: CertificateRenewalKeySource;
+    issuerType: IssuerType;
+    caType?: CaType;
+    hasStoredKey: boolean;
+  }) => {
+    if (keySource === CertificateRenewalKeySource.New) return;
+
+    if (issuerType !== IssuerType.CA) {
+      if (keySource === CertificateRenewalKeySource.Csr) {
+        throw new BadRequestError({
+          message:
+            "Self-signed certificates cannot be renewed from a signing request, because signing one requires the private key that a request does not carry. Reuse the existing key pair, or renew with a new one."
+        });
+      }
+      if (!hasStoredKey) {
+        throw new BadRequestError({
+          message:
+            "This self-signed certificate's key pair cannot be reused because Infisical does not hold its private key, which is what signs a self-signed certificate. Renew with a new key pair."
+        });
+      }
+      return;
+    }
+
+    if (keySource === CertificateRenewalKeySource.Csr && caType && !caIssuesFromCsr(caType)) {
+      throw new BadRequestError({
+        message: `${CERTIFICATE_AUTHORITIES_TYPE_MAP[caType]} can't issue a certificate from a signing request, so this certificate can't renew from a CSR or reuse its key pair without the private key. Renew with a new key pair.`
+      });
+    }
+
+    if (keySource === CertificateRenewalKeySource.Reuse && caType !== CaType.INTERNAL) {
+      throw new BadRequestError({
+        message:
+          "This certificate authority can reuse a key pair only from a signing request, not from a private key Infisical holds. Renew with a new key pair, or export the private key and use a CSR generated from it."
+      });
+    }
+  };
+
+  const $completeInternalCaRenewal = async ({
+    ca,
+    profile,
+    policy,
+    originalCert,
+    certificateRequest,
+    renewalAltNames,
+    renewalBasicConstraints,
+    ttl,
+    notBefore,
+    notAfter,
+    finalRenewBeforeDays,
+    effectiveSignatureAlgorithm,
+    effectiveKeyAlgorithm,
+    actorCtx,
+    removeRootsFromChain,
+    resolvedCustomExtensions,
+    approvedCertificateRequestId
+  }: {
+    ca: TCertificateAuthorityWithAssociatedCa;
+    profile: TCertificateProfileWithConfigs;
+    policy: Awaited<ReturnType<TCertificatePolicyServiceFactory["getPolicyById"]>>;
+    originalCert: TCertificates;
+    certificateRequest: TCertificateRequest;
+    renewalAltNames: { type: CertSubjectAlternativeNameType; value: string }[];
+    renewalBasicConstraints: { isCA: boolean; pathLength?: number | null } | undefined;
+    ttl: string;
+    notBefore: Date;
+    notAfter: Date;
+    finalRenewBeforeDays: number | undefined;
+    effectiveSignatureAlgorithm: CertSignatureAlgorithm;
+    effectiveKeyAlgorithm: CertKeyAlgorithm;
+    actorCtx: TRenewalActor;
+    removeRootsFromChain?: boolean;
+    resolvedCustomExtensions?: TResolvedCustomExtension[];
+    approvedCertificateRequestId?: string;
+  }): Promise<TCertificateIssuanceResponse> => {
+    const pendingRequest = await $openRenewalRequest(
+      {
+        internal: true,
+        ...actorCtx,
+        projectId: originalCert.projectId,
+        caId: ca.id,
+        profileId: originalCert.profileId ?? undefined,
+        applicationId: originalCert.applicationId ?? undefined,
+        commonName: certificateRequest.commonName,
+        altNames: renewalAltNames,
+        keyUsages: certificateRequest.keyUsages,
+        extendedKeyUsages: certificateRequest.extendedKeyUsages,
+        notBefore,
+        notAfter,
+        keyAlgorithm: effectiveKeyAlgorithm,
+        signatureAlgorithm: effectiveSignatureAlgorithm,
+        metadata: `Renewed from certificate ID: ${originalCert.id}`,
+        customExtensions: resolvedCustomExtensions,
+        status: CertificateRequestStatus.PENDING,
+        ttl,
+        enrollmentType: EnrollmentType.API,
+        organization: certificateRequest.organization,
+        organizationalUnit: certificateRequest.organizationalUnit,
+        country: certificateRequest.country,
+        state: certificateRequest.state,
+        locality: certificateRequest.locality,
+        domainComponents: certificateRequest.domainComponents,
+        ...(certificateRequest.basicConstraints && { basicConstraints: certificateRequest.basicConstraints })
+      },
+      approvedCertificateRequestId
+    );
+
+    let caResult: Awaited<ReturnType<typeof internalCaService.issueCertFromCa>>;
+    try {
+      caResult = await internalCaService.issueCertFromCa({
+        caId: ca.id,
+        customExtensions: resolvedCustomExtensions,
+        friendlyName: originalCert.friendlyName || certificateRequest.commonName || "Renewed Certificate",
+        commonName: certificateRequest.commonName || "",
+        altNames: renewalAltNames.map((san) => san.value).join(","),
+        altNameEntries: renewalAltNames,
+        ...(renewalBasicConstraints && {
+          basicConstraints: { isCA: true, pathLength: policy?.basicConstraints?.maxPathLength },
+          pathLength: renewalBasicConstraints.pathLength
+        }),
+        ttl,
+        notBefore: normalizeDateForApi(notBefore),
+        notAfter: normalizeDateForApi(notAfter),
+        keyUsages: convertKeyUsageArrayToLegacy(certificateRequest.keyUsages),
+        extendedKeyUsages: convertExtendedKeyUsageArrayToLegacy(certificateRequest.extendedKeyUsages),
+        signatureAlgorithm: effectiveSignatureAlgorithm,
+        keyAlgorithm: effectiveKeyAlgorithm,
+        isFromProfile: true,
+        organization: certificateRequest.organization,
+        ou: certificateRequest.organizationalUnit,
+        country: certificateRequest.country,
+        state: certificateRequest.state,
+        locality: certificateRequest.locality,
+        domainComponents: certificateRequest.domainComponents,
+        ...actorCtx,
+        internal: true,
+        onPersisted: async (newCert, tx) => {
+          await attachCertificateToPendingRequest(
+            certificateRequestDAL,
+            {
+              certificateRequestId: pendingRequest.id,
+              certificateId: newCert.id,
+              projectId: originalCert.projectId,
+              operation: CertificateIssuanceOperation.RENEW
+            },
+            tx
+          );
+
+          await $linkRenewedCertificate(
+            {
+              newCert,
+              originalCert,
+              finalRenewBeforeDays,
+              certificateRequestId: pendingRequest.id,
+              certificateRequestCreatedAt: pendingRequest.createdAt,
+              isRequestMetadataCopied: Boolean(approvedCertificateRequestId),
+              orgId: actorCtx.actorOrgId
+            },
+            tx
+          );
+        }
+      });
+    } catch (err) {
+      await markPendingRequestFailed(certificateRequestDAL, {
+        certificateRequestId: pendingRequest.id,
+        error: err,
+        fallbackMessage: "Certificate renewal failed"
+      });
+      throw err;
+    }
+
+    return $finalizeRenewal({
+      newCertificateId: caResult.certificateId,
+      originalCert,
+      profile,
+      certificate: caResult.certificate,
+      issuingCaCertificate: caResult.issuingCaCertificate,
+      certificateChain: caResult.certificateChain,
+      serialNumber: caResult.serialNumber,
+      certificateRequestId: pendingRequest.id,
+      commonName: certificateRequest.commonName || "",
+      fallbackProfileName: "Renewed Certificate",
+      removeRootsFromChain,
+      actor: actorCtx.actor,
+      actorId: actorCtx.actorId,
+      actorOrgId: actorCtx.actorOrgId
+    });
+  };
+
+  const $assertRequestedAlgorithmsLicensed = async ({
+    originalCert,
+    csrRenewalRequest,
+    attributes
+  }: {
+    originalCert: TCertificates;
+    csrRenewalRequest: TCertificateRequest | null;
+    attributes?: TRenewalAttributes;
+  }) => {
+    const requested = [
+      attributes?.keyAlgorithm,
+      attributes?.signatureAlgorithm,
+      csrRenewalRequest?.keyAlgorithm,
+      csrRenewalRequest?.signatureAlgorithm
+    ].filter((algorithm): algorithm is string => typeof algorithm === "string" && isPqcAlgorithm(algorithm));
+
+    if (!requested.length) return;
+
+    for await (const keyAlgorithm of requested) {
+      await validatePqcLicense({ keyAlgorithm, projectId: originalCert.projectId, projectDAL, licenseService });
+    }
+  };
+
+  // Renewal is exempt from the certificate caps only while it stays the same logical certificate: a
+  // refused renewal lets a live certificate expire. The flow lets the caller rewrite the common name
+  // and SANs though, and a renewal that does inserts a row under a quota key the org has never held,
+  // so that one is a new certificate wearing a renewal's clothes and takes the issuance caps.
+  const $assertRenewalQuota = async ({
+    originalCert,
+    csrRenewalRequest,
+    attributes
+  }: {
+    originalCert: TCertificates;
+    csrRenewalRequest: TCertificateRequest | null;
+    attributes?: TRenewalAttributes;
+  }) => {
+    // Same merge $buildValidatedRenewalRequest performs, so the key checked here is the key stored.
+    const renewedRequest =
+      csrRenewalRequest ??
+      buildRenewalCertificateRequest({
+        original: {
+          commonName: originalCert.commonName || undefined,
+          subjectAlternativeNames: originalCert.altNames
+            ? originalCert.altNames.split(",").map((san) => detectSanType(san.trim()))
+            : []
+        } as TCertificateRequest,
+        attributes
+      });
+
+    const renewedAltNames = (renewedRequest.subjectAlternativeNames ?? []).map((san) => san.value).join(",");
+    const renewedQuotaKey = buildCertificateQuotaKey({
+      commonName: renewedRequest.commonName,
+      altNames: renewedAltNames
+    });
+
+    // Compared against the key derived from the row rather than the stored quotaKey, because the
+    // question is only whether the names changed. Were the hash ever to change, every stored key would
+    // go stale at once and reading it here would make every renewal look like a new certificate.
+    if (renewedQuotaKey === buildCertificateQuotaKey(originalCert)) return undefined;
+
+    return validateCertificateRequestLicense({
+      request: renewedRequest,
+      altNames: renewedAltNames,
+      projectId: originalCert.projectId,
+      projectDAL,
+      licenseService,
+      quotaDeps
+    });
+  };
+
+  const $resolveApplicationName = async (applicationId?: string | null) => {
+    if (!applicationId) return null;
+    const application = await pkiApplicationDAL.findById(applicationId);
+    return application?.name ?? null;
+  };
+
+  const $holdRenewalForApproval = async (
+    {
+      approval,
+      actorCtx,
+      originalCert,
+      profile,
+      caId,
+      keySource,
+      csr,
+      requestedRenewal,
+      attributes,
+      externalConfiguration,
+      certificateRequest,
+      approvalSnapshot,
+      renewalAltNames,
+      renewalBasicConstraints,
+      effectiveKeyAlgorithm,
+      effectiveSignatureAlgorithm,
+      ttl,
+      resolvedCustomExtensions
+    }: {
+      approval: {
+        policy: TCertificateRequestApprovalPolicy;
+        requester: { requesterName: string; requesterEmail: string };
+      };
+      actorCtx: TRenewalActor;
+      originalCert: TCertificates;
+      profile: TCertificateProfileWithConfigs;
+      caId?: string;
+      keySource: CertificateRenewalKeySource;
+      csr?: string;
+      requestedRenewal: { renewalKeySource: CertificateRenewalKeySource; csr?: string };
+      attributes?: TRenewalAttributes;
+      externalConfiguration?: TRenewCertificateDTO["externalConfiguration"];
+      certificateRequest: TCertificateRequest;
+      approvalSnapshot: TCertRequestRequestData["certificateRequest"];
+      renewalAltNames: { type: CertSubjectAlternativeNameType; value: string }[];
+      renewalBasicConstraints?: { isCA: boolean; pathLength?: number };
+      effectiveKeyAlgorithm: CertKeyAlgorithm;
+      effectiveSignatureAlgorithm: CertSignatureAlgorithm;
+      ttl: string;
+      resolvedCustomExtensions?: TResolvedCustomExtension[];
+    },
+    tx: Knex
+  ) => {
+    await certificateDAL.findByIdForUpdate(originalCert.id, tx);
+    if (
+      await certificateDAL.hasRenewalAwaitingApproval(
+        { certificateId: originalCert.id, projectId: originalCert.projectId },
+        tx
+      )
+    ) {
+      throw new BadRequestError({ message: "A renewal of this certificate is already waiting for approval." });
+    }
+
+    return holdCertificateRequestForApproval(
+      { certificateRequestDAL, approvalPolicyService },
+      {
+        approvalPolicy: approval.policy,
+        projectId: originalCert.projectId,
+        organizationId: profile.project?.orgId ?? actorCtx.actorOrgId,
+        createCertificateRequest: async () => {
+          const heldRequest = await certificateRequestService.createCertificateRequest({
+            internal: true,
+            ...actorCtx,
+            projectId: originalCert.projectId,
+            tx,
+            caId,
+            profileId: profile.id,
+            applicationId: originalCert.applicationId ?? undefined,
+            ...(keySource === CertificateRenewalKeySource.Csr && { csr }),
+            commonName: certificateRequest.commonName,
+            altNames: renewalAltNames,
+            keyUsages: certificateRequest.keyUsages,
+            extendedKeyUsages: certificateRequest.extendedKeyUsages,
+            keyAlgorithm: effectiveKeyAlgorithm,
+            signatureAlgorithm: effectiveSignatureAlgorithm,
+            metadata: `Renewed from certificate ID: ${originalCert.id}`,
+            customExtensions: resolvedCustomExtensions,
+            status: CertificateRequestStatus.PENDING_APPROVAL,
+            ttl,
+            enrollmentType: EnrollmentType.API,
+            organization: certificateRequest.organization,
+            organizationalUnit: certificateRequest.organizationalUnit,
+            country: certificateRequest.country,
+            state: certificateRequest.state,
+            locality: certificateRequest.locality,
+            domainComponents: certificateRequest.domainComponents,
+            ...(renewalBasicConstraints && { basicConstraints: renewalBasicConstraints })
+          });
+          await copyMetadataFromCertificate(resourceMetadataDAL, {
+            sourceCertificateId: originalCert.id,
+            targetCertificateRequestId: heldRequest.id,
+            targetCertificateRequestCreatedAt: heldRequest.createdAt,
+            orgId: profile.project?.orgId ?? actorCtx.actorOrgId,
+            tx
+          });
+          return heldRequest;
+        },
+        requestData: {
+          profileId: profile.id,
+          profileName: profile.slug,
+          certificateRequest: approvalSnapshot,
+          renewal: {
+            certificateId: originalCert.id,
+            ...requestedRenewal,
+            attributes,
+            caId,
+            ...(externalConfiguration && { externalConfiguration })
+          }
+        },
+        justification: `Certificate renewal request for ${certificateRequest.commonName || profile.slug}`,
+        requester: {
+          actor: actorCtx.actor,
+          actorId: actorCtx.actorId,
+          name: approval.requester.requesterName,
+          email: approval.requester.requesterEmail
+        },
+        tx
+      }
+    );
+  };
+
+  const recordRejectedRenewal = async (certificateId: string) => {
+    const certificate = await certificateDAL.findById(certificateId);
+    if (!certificate || !isSourcedOutsideInfisical(certificate)) return;
+
+    await certificateDAL.updateById(certificateId, {
+      renewalError: "A renewal of this certificate was rejected. Renew it manually to request approval again."
+    });
+  };
+
+  const $matchRenewalApprovalPolicy = async ({
+    originalCert,
+    actor
+  }: {
+    originalCert: TCertificates;
+    actor: ActorType;
+  }) => {
+    if (!originalCert.profileId) return null;
+
+    const profile = await certificateProfileDAL.findByIdWithConfigs(originalCert.profileId);
+    if (!profile) return null;
+
+    return matchCertificateRequestApprovalPolicy(
+      { approvalPolicyService, approvalPolicyDAL },
+      {
+        projectId: profile.projectId,
+        profileName: profile.slug,
+        applicationId: originalCert.applicationId,
+        actor
+      }
+    );
+  };
+
+  const renewCertificate = async ({
+    certificateId,
+    actor,
+    actorId,
+    actorAuthMethod,
+    actorOrgId,
+    internal = false,
+    removeRootsFromChain,
+    renewalKeySource: requestedKeySource,
+    csr: requestedCsr,
+    attributes,
+    externalConfiguration,
+    approvedRenewal
+  }: Omit<TRenewCertificateDTO, "certificateRequestId"> & {
+    internal?: boolean;
+    approvedRenewal?: {
+      certificateRequestId: string;
+      reviewedCertificateRequest: TCertRequestRequestData["certificateRequest"];
+      reviewedCaId?: string;
+    };
+  }): Promise<TCertificateIssuanceResponse> => {
+    const approvedCertificateRequestId = approvedRenewal?.certificateRequestId;
+    const actorCtx: TRenewalActor = { actor, actorId, actorAuthMethod, actorOrgId };
+    const callerKeySource = resolveRenewalKeySource({ renewalKeySource: requestedKeySource, csr: requestedCsr });
+    let keySource = callerKeySource;
+    let csr = requestedCsr;
+
+    // Without the private key, reusing the key pair means renewing from the CSR Infisical holds for it, so
+    // it runs as a CSR renewal: the CSR is the source of truth for the subject and names on every CA type.
+    let isStoredCsr = false;
+    if (
+      keySource === CertificateRenewalKeySource.Reuse &&
+      !(await certificateSecretDAL.findOne({ certId: certificateId }))
+    ) {
+      const storedCsr = await $findStoredCsr(certificateId);
+      if (storedCsr) {
+        keySource = CertificateRenewalKeySource.Csr;
+        csr = storedCsr;
+        isStoredCsr = true;
+      }
+    }
+
+    let csrRenewalRequest: TCertificateRequest | null = null;
+    if (keySource === CertificateRenewalKeySource.Csr && csr) {
+      assertCsrRenewalAttributes(attributes, { isStoredCsr });
+      csrRenewalRequest = buildCsrRenewalCertificateRequest({ csr, attributes });
+    }
+
+    // Decided from what the caller asked for: resubmitting the stored CSR is how Infisical carries out a
+    // Reuse, not an edit, so it must not demand certificate Edit from a role that may only renew.
+    const isEditingCertificate = isCertificateContentEdit({ keySource: callerKeySource, attributes });
+    let changedAttributes: TRenewalAuditChange[] = [];
+
+    // Read once for both licence checks. They run before the transaction because getPlan can reach
+    // Redis and the License Server, and the renewal transaction must hold no network call.
+    const certForLicenseChecks = await certificateDAL.findById(certificateId);
+    if (!certForLicenseChecks) {
+      throw new NotFoundError({ message: "Certificate not found" });
+    }
+
+    await $assertRequestedAlgorithmsLicensed({ originalCert: certForLicenseChecks, csrRenewalRequest, attributes });
+    const quotaUsage = await $assertRenewalQuota({ originalCert: certForLicenseChecks, csrRenewalRequest, attributes });
+
+    const approvalPolicy = approvedRenewal
+      ? null
+      : await $matchRenewalApprovalPolicy({ originalCert: certForLicenseChecks, actor });
+    const approval = approvalPolicy
+      ? { policy: approvalPolicy, requester: await $resolveRequesterInfo(actor, actorId, EnrollmentType.API) }
+      : null;
+
+    const runRenewal = () =>
+      certificateDAL.transaction(async (tx) => {
+        const {
+          originalCert,
+          profile,
+          certificateSecret,
+          originalSignatureAlgorithm,
+          originalKeyAlgorithm,
+          originatingRequest
+        } = await $loadRenewalSubject({ certificateId, keySource }, tx);
+
+        const renewalAuth = internal
+          ? undefined
+          : await $authorizeRenewal({ originalCert, profile, actorCtx, isEditingCertificate }, tx);
+
+        assertCertificateNotDeleted(originalCert);
+
+        const { issuerType, ca, caType, policy } = await $resolveRenewalIssuer(
+          {
+            originalCert,
+            profile,
+            actorCtx,
+            internal,
+            requestedTtl: csrRenewalRequest?.validity?.ttl ?? attributes?.ttl
+          },
+          tx
+        );
+
+        if (externalConfiguration?.reissue) {
+          if (!(caType && caSupportsCapability(caType, CaCapability.REISSUE_CERTIFICATES))) {
+            const reissuingCaNames = Object.values(CaType)
+              .filter((type) => caSupportsCapability(type, CaCapability.REISSUE_CERTIFICATES))
+              .map((type) => CERTIFICATE_AUTHORITIES_TYPE_MAP[type]);
+            throw new BadRequestError({
+              message: `Reissue is only available for certificates issued by these CAs: ${reissuingCaNames.join(", ")}.`
+            });
+          }
+          if (attributes?.ttl) {
+            throw new BadRequestError({ message: "Remove the TTL. It can't be set on a reissue." });
+          }
+          if (!CertificateReissueMap[caType]?.orderSchema.safeParse(originalCert.externalMetadata).success) {
+            throw new BadRequestError({
+              message: "This certificate has no order with its CA to reissue. Place a new order instead."
+            });
+          }
+        }
+
+        const { certificateRequest, replayedRequest, ttl, resolvedCustomExtensions } = $buildValidatedRenewalRequest({
+          originalCert,
+          policy,
+          csrRenewalRequest,
+          issuedFrom: originatingRequest,
+          attributes,
+          keySource,
+          originalSignatureAlgorithm,
+          originalKeyAlgorithm,
+          profileCustomExtensions: profile?.defaults?.customExtensions,
+          maxTtlDays:
+            externalConfiguration?.reissue && caType ? CertificateReissueMap[caType]?.maxValidityDays : undefined
+        });
+
+        changedAttributes = buildRenewalAuditChanges(replayedRequest, { ...certificateRequest, validity: { ttl } });
+
+        if (externalConfiguration?.reissue && !internal) {
+          const requestedNames = new Set(
+            [
+              certificateRequest.commonName,
+              ...(certificateRequest.subjectAlternativeNames ?? []).map((san) => san.value)
+            ]
+              .filter(Boolean)
+              .map((name) => (name as string).trim().toLowerCase())
+          );
+          const isRemovingName = [originalCert.commonName, ...(originalCert.altNames?.split(",") ?? [])]
+            .filter(Boolean)
+            .some((name) => !requestedNames.has((name as string).trim().toLowerCase()));
+          if (isRemovingName) {
+            await assertCanRevokeCertificate({
+              certificate: originalCert,
+              ...actorCtx,
+              permissionService,
+              resourceMetadataDAL,
+              tx
+            });
+          }
+        }
+
+        if (renewalAuth?.projectPermission) {
+          assertCanEditCertificateResult({
+            projectPermission: renewalAuth.projectPermission,
+            commonName: certificateRequest.commonName,
+            altNames: (certificateRequest.subjectAlternativeNames ?? []).map((san) => san.value),
+            serialNumber: originalCert.serialNumber,
+            metadata: renewalAuth.certMetadata
+          });
+        }
+
+        const notBefore = new Date();
+        const notAfter = new Date(Date.now() + ms(ttl));
+
+        const effectiveApiConfig = await resolveEffectiveApiConfig({
+          applicationId: originalCert.applicationId ?? undefined,
+          profileId: profile.id,
+          profileApiConfig: profile.apiConfig,
+          pkiApplicationProfileDAL,
+          apiEnrollmentConfigDAL
+        });
+        const finalRenewBeforeDays = resolveRenewedCertificateRenewBeforeDays({
+          apiConfig: effectiveApiConfig,
+          previousRenewBeforeDays: originalCert.renewBeforeDays,
+          ttl,
+          notAfter
+        });
+
+        const { signatureAlgorithm: effectiveSignatureAlgorithm, keyAlgorithm: effectiveKeyAlgorithm } =
+          getEffectiveAlgorithms(
+            certificateRequest.signatureAlgorithm as CertSignatureAlgorithm,
+            certificateRequest.keyAlgorithm as CertKeyAlgorithm,
+            originalSignatureAlgorithm,
+            originalKeyAlgorithm
+          );
+        const renewalAltNames = certificateRequest.subjectAlternativeNames ?? [];
+        const renewalBasicConstraints = certificateRequest.basicConstraints?.isCA
+          ? { isCA: true, pathLength: certificateRequest.basicConstraints.pathLength }
+          : undefined;
+
+        $assertKeySourceSupported({ keySource, issuerType, caType, hasStoredKey: Boolean(certificateSecret) });
+
+        if (ca && caType === CaType.INTERNAL) {
+          if (keySource !== CertificateRenewalKeySource.New) validateCaSupport(ca, "CSR signing");
+          validateAlgorithmCompatibility(ca, { algorithms: policy?.algorithms } as {
+            algorithms?: { signature?: string[] };
+          });
+        }
+
+        const approvalSnapshot = buildRenewalApprovalSnapshot({
+          certificateRequest,
+          renewalAltNames,
+          ttl,
+          effectiveSignatureAlgorithm,
+          effectiveKeyAlgorithm,
+          renewalBasicConstraints,
+          resolvedCustomExtensions
+        });
+
+        if (approvedRenewal) {
+          if (originalCert.renewedByCertificateId || originalCert.revokedAt) {
+            throw new BadRequestError({
+              message: "The certificate was renewed or revoked while this renewal waited for approval."
+            });
+          }
+          if (approvedRenewal.reviewedCaId !== ca?.id) {
+            throw new BadRequestError({
+              message:
+                "This renewal no longer matches what was approved, because the certificate's profile now issues from a different certificate authority. Renew the certificate again to request a new approval."
+            });
+          }
+          if (!isSameRenewalApprovalSnapshot(approvedRenewal.reviewedCertificateRequest, approvalSnapshot)) {
+            throw new BadRequestError({
+              message:
+                "This renewal no longer matches what was approved, because the certificate's profile or policy changed while it waited. Renew the certificate again to request a new approval."
+            });
+          }
+        }
+
+        const changesCertificate =
+          callerKeySource === CertificateRenewalKeySource.Csr ||
+          changedAttributes.length > 0 ||
+          haveDifferentSubjectAlternativeNames(replayedRequest, certificateRequest) ||
+          haveDifferentCustomExtensions(originalCert.customExtensions, resolvedCustomExtensions);
+        if (approval && (isSourcedOutsideInfisical(originalCert) || changesCertificate)) {
+          const { certificateRequestId: heldRequestId, notifyApprovers } = await $holdRenewalForApproval(
+            {
+              approval,
+              actorCtx,
+              originalCert,
+              profile,
+              caId: ca?.id,
+              keySource,
+              csr,
+              requestedRenewal: { renewalKeySource: callerKeySource, csr: requestedCsr },
+              attributes,
+              externalConfiguration,
+              certificateRequest,
+              approvalSnapshot,
+              renewalAltNames,
+              renewalBasicConstraints,
+              effectiveKeyAlgorithm,
+              effectiveSignatureAlgorithm,
+              ttl,
+              resolvedCustomExtensions
+            },
+            tx
+          );
+
+          return {
+            renewalMode: CertificateRenewalMode.AwaitingApproval as const,
+            certificateRequestId: heldRequestId,
+            notifyApprovers,
+            originalCert,
+            profile,
+            commonName: certificateRequest.commonName
+          };
+        }
+
+        if (keySource !== CertificateRenewalKeySource.New && caType === CaType.INTERNAL && ca) {
+          return {
+            renewalMode: CertificateRenewalMode.KeyPreserving as const,
+            resolvedCustomExtensions,
+            keySource,
+            csr,
+            ca,
+            profile,
+            policy,
+            originalCert,
+            certificateRequest,
+            certificateSecret,
+            ttl,
+            notBefore,
+            notAfter,
+            finalRenewBeforeDays,
+            effectiveKeyAlgorithm,
+            effectiveSignatureAlgorithm
+          };
+        }
+
+        if (issuerType === IssuerType.CA) {
+          if (!ca) {
+            throw new NotFoundError({ message: "Certificate Authority not found for CA-signed certificate renewal" });
+          }
+
+          if (caType === CaType.INTERNAL) {
+            return {
+              renewalMode: CertificateRenewalMode.InternalCa as const,
+              resolvedCustomExtensions,
+              ca,
+              profile,
+              policy,
+              originalCert,
+              certificateRequest,
+              renewalAltNames,
+              renewalBasicConstraints,
+              ttl,
+              notBefore,
+              notAfter,
+              finalRenewBeforeDays,
+              effectiveSignatureAlgorithm,
+              effectiveKeyAlgorithm
+            };
+          }
+          if (caType && caSupportsCapability(caType, CaCapability.RENEW_CERTIFICATES)) {
+            return {
+              renewalMode: CertificateRenewalMode.ExternalCa as const,
+              ca,
+              profile,
+              originalCert,
+              certificateRequest,
+              renewalAltNames,
+              renewalBasicConstraints,
+              resolvedCustomExtensions,
+              effectiveSignatureAlgorithm,
+              effectiveKeyAlgorithm,
+              ttl
+            };
+          }
+          throw new BadRequestError({
+            message: `CA type ${String(caType)} does not support certificate renewal`
+          });
+        }
+
+        const existingKeyPair =
+          keySource === CertificateRenewalKeySource.Reuse && certificateSecret
+            ? await importKeyPairFromPem({
+                privateKeyPem: await $decryptCertificatePrivateKey({
+                  projectId: originalCert.projectId,
+                  encryptedPrivateKey: certificateSecret.encryptedPrivateKey
+                }),
+                keyAlgorithm: effectiveKeyAlgorithm
+              })
+            : undefined;
+
+        const selfSignedRenewalResult = await processSelfSignedCertificate({
+          certificateRequest: { ...certificateRequest, altNames: renewalAltNames },
+          policy,
+          profile,
+          originalCert,
+          customExtensions: resolvedCustomExtensions,
+          effectiveAlgorithms: {
+            signatureAlgorithm: effectiveSignatureAlgorithm,
+            keyAlgorithm: effectiveKeyAlgorithm
+          },
+          certificateDAL,
+          certificateBodyDAL,
+          certificateSecretDAL,
+          kmsService,
+          projectDAL,
+          tx,
+          isRenewal: true,
+          existingKeyPair
+        });
+
+        const certificate = selfSignedRenewalResult.selfSignedResult.certificate.toString("utf8");
+        const { serialNumber } = selfSignedRenewalResult.selfSignedResult;
+        const newCert = selfSignedRenewalResult.certificateData;
+
+        const certRequestResult = await $openRenewalRequest(
+          {
+            internal: true,
+            customExtensions: resolvedCustomExtensions,
+            actor,
+            actorId,
+            actorAuthMethod,
+            actorOrgId,
+            projectId: originalCert.projectId,
+            tx,
+            caId: ca?.id || originalCert.caId || undefined,
+            profileId: originalCert.profileId || undefined,
+            applicationId: originalCert.applicationId ?? undefined,
+            commonName: certificateRequest.commonName,
+            altNames: renewalAltNames,
+            keyUsages: certificateRequest.keyUsages,
+            extendedKeyUsages: certificateRequest.extendedKeyUsages,
+            notBefore: new Date(newCert.notBefore),
+            notAfter: new Date(newCert.notAfter),
+            keyAlgorithm: effectiveKeyAlgorithm,
+            signatureAlgorithm: effectiveSignatureAlgorithm,
+            metadata: `Renewed from certificate ID: ${originalCert.id}`,
+            status: CertificateRequestStatus.ISSUED,
+            certificateId: newCert.id,
+            ttl,
+            enrollmentType: EnrollmentType.API,
+            organization: certificateRequest.organization,
+            organizationalUnit: certificateRequest.organizationalUnit,
+            country: certificateRequest.country,
+            state: certificateRequest.state,
+            locality: certificateRequest.locality,
+            domainComponents: certificateRequest.domainComponents,
+            ...(renewalBasicConstraints && { basicConstraints: renewalBasicConstraints })
+          },
+          approvedCertificateRequestId
+        );
+
+        await $linkRenewedCertificate(
+          {
+            newCert,
+            originalCert,
+            finalRenewBeforeDays,
+            isRenewalLinkPreset: true,
+            certificateRequestId: certRequestResult.id,
+            certificateRequestCreatedAt: certRequestResult.createdAt,
+            isRequestMetadataCopied: Boolean(approvedCertificateRequestId),
+            orgId: actorOrgId
+          },
+          tx
+        );
+
+        return {
+          renewalMode: CertificateRenewalMode.SelfSigned as const,
+          certificate,
+          serialNumber,
+          newCert,
+          originalCert,
+          profile,
+          certRequestResult
+        };
+      });
+
+    let renewalResult: Awaited<ReturnType<typeof runRenewal>>;
+    try {
+      renewalResult = await runRenewal();
+    } catch (err) {
+      if (err instanceof RenewalBlockedError) {
+        await certificateDAL.updateById(certificateId, { renewalError: err.renewalError });
+      }
+      throw err;
+    }
+
+    if (renewalResult.renewalMode === CertificateRenewalMode.AwaitingApproval) {
+      await renewalResult.notifyApprovers();
+      return {
+        status: CertificateRequestStatus.PENDING_APPROVAL,
+        certificate: "",
+        certificateChain: "",
+        issuingCaCertificate: "",
+        serialNumber: "",
+        certificateId: "",
+        certificateRequestId: renewalResult.certificateRequestId,
+        projectId: renewalResult.originalCert.projectId,
+        profileName: renewalResult.profile.slug,
+        commonName: renewalResult.commonName || "",
+        message: "Certificate renewal requires approval",
+        changedAttributes,
+        applicationId: renewalResult.originalCert.applicationId ?? null,
+        applicationName: await $resolveApplicationName(renewalResult.originalCert.applicationId)
+      };
+    }
+
+    await recordQuotaUsage(quotaUsage);
+
+    if (renewalResult.renewalMode === CertificateRenewalMode.KeyPreserving) {
+      const response = await $completeKeyPreservingRenewal({
+        ...renewalResult,
+        approvedCertificateRequestId,
+        actor,
+        actorId,
+        actorAuthMethod,
+        actorOrgId,
+        removeRootsFromChain
+      });
+      return {
+        ...response,
+        changedAttributes,
+        applicationId: renewalResult.originalCert.applicationId ?? null,
+        applicationName: await $resolveApplicationName(renewalResult.originalCert.applicationId)
+      };
+    }
+
+    if (renewalResult.renewalMode === CertificateRenewalMode.InternalCa) {
+      const response = await $completeInternalCaRenewal({
+        ...renewalResult,
+        actorCtx,
+        removeRootsFromChain,
+        approvedCertificateRequestId
+      });
+      return {
+        ...response,
+        changedAttributes,
+        applicationId: renewalResult.originalCert.applicationId ?? null,
+        applicationName: await $resolveApplicationName(renewalResult.originalCert.applicationId)
+      };
+    }
+
+    if (renewalResult.renewalMode === CertificateRenewalMode.ExternalCa) {
+      const {
+        ca,
+        profile,
+        originalCert,
+        certificateRequest: renewalRequest,
+        renewalAltNames: structuredAltNames,
+        renewalBasicConstraints,
+        resolvedCustomExtensions,
+        effectiveSignatureAlgorithm,
+        effectiveKeyAlgorithm,
+        ttl
+      } = renewalResult;
+
+      const renewalOrderId = randomUUID();
+
+      const certificateRequest = await $openRenewalRequest(
+        {
+          internal: true,
+          customExtensions: resolvedCustomExtensions,
+          actor,
+          actorId,
+          actorAuthMethod,
+          actorOrgId,
+          projectId: originalCert.projectId,
+          profileId: profile?.id,
+          applicationId: originalCert.applicationId ?? undefined,
+          caId: ca.id,
+          csr,
+          commonName: renewalRequest.commonName,
+          altNames: structuredAltNames,
+          keyUsages: renewalRequest.keyUsages,
+          extendedKeyUsages: renewalRequest.extendedKeyUsages,
+          keyAlgorithm: effectiveKeyAlgorithm,
+          signatureAlgorithm: effectiveSignatureAlgorithm,
+          metadata: `Renewed from certificate ID: ${originalCert.id}`,
+          status: CertificateRequestStatus.PENDING,
+          ttl,
+          enrollmentType: EnrollmentType.API,
+          organization: renewalRequest.organization,
+          organizationalUnit: renewalRequest.organizationalUnit,
+          country: renewalRequest.country,
+          state: renewalRequest.state,
+          locality: renewalRequest.locality,
+          domainComponents: renewalRequest.domainComponents,
+          basicConstraints: renewalBasicConstraints
+        },
+        approvedCertificateRequestId
+      );
+
+      await certificateDAL.transaction(async (tx) => {
+        if (approvedCertificateRequestId) {
+          await resourceMetadataDAL.delete({ certificateRequestId: certificateRequest.id }, tx);
+        }
+        await copyMetadataFromCertificate(resourceMetadataDAL, {
+          sourceCertificateId: originalCert.id,
+          targetCertificateRequestId: certificateRequest.id,
+          targetCertificateRequestCreatedAt: certificateRequest.createdAt,
+          orgId: actorOrgId,
+          tx
+        });
+      });
+
+      await certificateIssuanceQueue.queueCertificateIssuance({
+        certificateId: renewalOrderId,
+        profileId: profile?.id || "",
+        caId: ca.id,
+        caType: (ca.externalCa?.type as CaType) ?? CaType.INTERNAL,
+        commonName: renewalRequest.commonName || "",
+        altNames: structuredAltNames,
+        ttl,
+        signatureAlgorithm: effectiveSignatureAlgorithm,
+        keyAlgorithm: effectiveKeyAlgorithm,
+        keyUsages: (renewalRequest.keyUsages ?? []).map(mapKeyUsageToLegacy),
+        extendedKeyUsages: (renewalRequest.extendedKeyUsages ?? []).map(mapExtendedKeyUsageToLegacy),
+        organization: renewalRequest.organization,
+        organizationalUnit: renewalRequest.organizationalUnit,
+        country: renewalRequest.country,
+        state: renewalRequest.state,
+        locality: renewalRequest.locality,
+        isRenewal: true,
+        ...(externalConfiguration && { externalConfiguration }),
+        originalCertificateId: certificateId,
+        certificateRequestId: certificateRequest.id,
+        basicConstraints: renewalBasicConstraints,
+        customExtensions: resolvedCustomExtensions,
+        ...(csr && { csr }),
+        ...(originalCert.applicationId && { applicationId: originalCert.applicationId })
+      });
+
+      return {
+        status: CertificateRequestStatus.PENDING,
+        certificate: "", // External CA renewal is async
+        certificateChain: "",
+        issuingCaCertificate: "",
+        serialNumber: "",
+        certificateId: renewalOrderId,
+        certificateRequestId: certificateRequest.id,
+        projectId: originalCert.projectId,
+        profileName: profile?.slug || "External CA Profile",
+        commonName: renewalRequest.commonName || "",
+        changedAttributes,
+        applicationId: originalCert.applicationId ?? null,
+        applicationName: await $resolveApplicationName(originalCert.applicationId)
+      };
+    }
+
+    const response = await $finalizeRenewal({
+      newCertificateId: renewalResult.newCert.id,
+      originalCert: renewalResult.originalCert,
+      profile: renewalResult.profile ?? null,
+      certificate: renewalResult.certificate,
+      issuingCaCertificate: "",
+      certificateChain: renewalResult.certificate,
+      serialNumber: renewalResult.serialNumber,
+      certificateRequestId: renewalResult.certRequestResult?.id || "",
+      commonName: renewalResult.newCert.commonName || "",
+      fallbackProfileName: "Self-signed Certificate",
+      removeRootsFromChain,
+      actor,
+      actorId,
+      actorOrgId
+    });
+    return { ...response, changedAttributes };
+  };
+
+  const $loadCertificateForRenewalConfig = async ({
+    certificateId,
+    actor,
+    actorId,
+    actorAuthMethod,
+    actorOrgId
+  }: {
+    certificateId: string;
+    actor: ActorType;
+    actorId: string;
+    actorAuthMethod: ActorAuthMethod;
+    actorOrgId: string;
+  }) => {
+    const certificate = await certificateDAL.findById(certificateId);
+    if (!certificate) {
+      throw new NotFoundError({ message: "Certificate not found" });
+    }
+
+    await assertCanEditCertificate({
+      certificate,
+      actor,
+      actorId,
+      actorAuthMethod,
+      actorOrgId,
+      permissionService,
+      resourceMetadataDAL
+    });
+
+    assertCertificateNotDeleted(certificate);
+
+    if (!certificate.profileId) {
+      throw new BadRequestError({
+        message: "Certificate is not eligible for auto-renewal: certificate was not issued from a profile"
+      });
+    }
+
+    return certificate;
+  };
+
+  const getRenewalPreview = async ({
+    certificateId,
+    actor,
+    actorId,
+    actorAuthMethod,
+    actorOrgId
+  }: {
+    certificateId: string;
+    actor: ActorType;
+    actorId: string;
+    actorAuthMethod: ActorAuthMethod;
+    actorOrgId: string;
+  }) => {
+    const certificate = await $loadCertificateForRenewalConfig({
+      certificateId,
+      actor,
+      actorId,
+      actorAuthMethod,
+      actorOrgId
+    });
+
+    const originatingRequest = await certificateDAL.getOriginatingRequestByCertId(certificate.id);
+    const storedCsr = await $findStoredCsr(certificate.id, originatingRequest.csr);
+
+    return buildRenewalPreview({ ...originatingRequest, csr: storedCsr }, certificate);
+  };
+
+  const updateRenewalConfig = async ({
+    certificateId,
+    renewBeforeDays,
+    actor,
+    actorId,
+    actorAuthMethod,
+    actorOrgId
+  }: TUpdateRenewalConfigDTO): Promise<TRenewalConfigResponse> => {
+    const certificate = await $loadCertificateForRenewalConfig({
+      certificateId,
+      actor,
+      actorId,
+      actorAuthMethod,
+      actorOrgId
+    });
+
+    const enrollmentType = await certificateDAL.getRequestEnrollmentTypeByCertId(certificate.id);
+    if (enrollmentType && enrollmentType !== EnrollmentType.API) {
+      throw new ForbiddenRequestError({
+        message: `Certificate is not eligible for auto-renewal: ${enrollmentType.toUpperCase()} certificates cannot be auto-renewed`
+      });
+    }
+
+    const certificateSecret = await certificateSecretDAL.findOne({ certId: certificate.id });
+    if (!certificateSecret && !(await certificateDAL.canRenewFromCsr(certificate.id))) {
+      throw new ForbiddenRequestError({
+        message:
+          "Certificate is not eligible for auto-renewal: Infisical holds neither its private key nor a signing request its certificate authority can renew it from. Renew it with a new key pair, or once with a CSR generated from its existing key, then turn on auto-renewal."
+      });
+    }
+
+    if (certificate.status !== CertStatus.ACTIVE) {
+      throw new BadRequestError({
+        message: `Certificate is not eligible for auto-renewal: certificate status is ${certificate.status}, must be ${CertStatus.ACTIVE}`
+      });
+    }
+
+    const now = new Date();
+    if (certificate.notAfter <= now) {
+      throw new BadRequestError({
+        message: "Certificate is not eligible for auto-renewal: certificate has expired"
+      });
+    }
+
+    if (certificate.revokedAt) {
+      throw new BadRequestError({
+        message: "Certificate is not eligible for auto-renewal: certificate has been revoked"
+      });
+    }
+
+    if (certificate.renewedByCertificateId) {
+      throw new BadRequestError({
+        message: "Certificate is not eligible for auto-renewal: certificate has already been renewed"
+      });
+    }
+
+    const certificateTtlInDays = Math.ceil(
+      (new Date(certificate.notAfter).getTime() - new Date(certificate.notBefore).getTime()) / (24 * 60 * 60 * 1000)
+    );
+
+    if (renewBeforeDays >= certificateTtlInDays) {
+      throw new BadRequestError({
+        message: "Invalid renewal configuration: renewal threshold exceeds certificate validity period"
+      });
+    }
+
+    if (!isValidRenewalTiming(renewBeforeDays, new Date(certificate.notAfter))) {
+      throw new BadRequestError({
+        message: "Invalid renewal configuration: renewal would be triggered immediately or in the past"
+      });
+    }
+
+    await certificateDAL.updateById(certificateId, { renewBeforeDays });
+
+    return {
+      projectId: certificate.projectId,
+      renewBeforeDays,
+      commonName: certificate.commonName || "",
+      applicationId: certificate.applicationId ?? null,
+      applicationName: await $resolveApplicationName(certificate.applicationId)
+    };
+  };
+
+  const disableRenewalConfig = async ({
+    certificateId,
+    actor,
+    actorId,
+    actorAuthMethod,
+    actorOrgId
+  }: TDisableRenewalConfigDTO): Promise<TDisableRenewalResponse> => {
+    const certificate = await $loadCertificateForRenewalConfig({
+      certificateId,
+      actor,
+      actorId,
+      actorAuthMethod,
+      actorOrgId
+    });
+
+    await certificateDAL.updateById(certificateId, { renewBeforeDays: null });
+
+    return {
+      projectId: certificate.projectId,
+      commonName: certificate.commonName || "",
+      applicationId: certificate.applicationId ?? null,
+      applicationName: await $resolveApplicationName(certificate.applicationId)
+    };
+  };
+
+  const $findLatestRenewalOf = async (certificateId: string) => {
+    let latestCertificateId = certificateId;
+    for (let hop = 0; hop < MAX_RENEWAL_CHAIN_HOPS; hop += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      const certificate = await certificateDAL.findById(latestCertificateId);
+      if (!certificate?.renewedByCertificateId) return latestCertificateId;
+      latestCertificateId = certificate.renewedByCertificateId;
+    }
+    return latestCertificateId;
+  };
+
+  const renewApprovedCertificate = async ({
+    certificateRequestId,
+    organizationId,
+    renewal,
+    reviewedCertificateRequest
+  }: {
+    certificateRequestId: string;
+    organizationId: string;
+    renewal: NonNullable<TCertRequestRequestData["renewal"]>;
+    reviewedCertificateRequest: TCertRequestRequestData["certificateRequest"];
+  }) =>
+    renewCertificate({
+      actor: ActorType.PLATFORM,
+      actorId: "",
+      actorAuthMethod: null,
+      actorOrgId: organizationId,
+      internal: true,
+      certificateId: await $findLatestRenewalOf(renewal.certificateId),
+      renewalKeySource: renewal.renewalKeySource,
+      csr: renewal.csr,
+      attributes: renewal.attributes,
+      externalConfiguration: renewal.externalConfiguration,
+      approvedRenewal: { certificateRequestId, reviewedCertificateRequest, reviewedCaId: renewal.caId }
+    });
+
+  return {
+    renewCertificate,
+    renewApprovedCertificate,
+    recordRejectedRenewal,
+    getRenewalPreview,
+    updateRenewalConfig,
+    disableRenewalConfig
+  };
+};

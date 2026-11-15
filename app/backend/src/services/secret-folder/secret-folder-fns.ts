@@ -1,0 +1,629 @@
+import { MongoAbility, subject } from "@casl/ability";
+import { Knex } from "knex";
+import { validate as uuidValidate } from "uuid";
+
+import { TSecretFolders } from "@app/db/schemas";
+import { TDynamicSecretDALFactory } from "@app/ee/services/dynamic-secret/dynamic-secret-dal";
+import { THoneyTokenDALFactory } from "@app/ee/services/honey-token/honey-token-dal";
+import { hasSecretReadValueOrDescribePermission } from "@app/ee/services/permission/permission-fns";
+import {
+  ProjectPermissionActions,
+  ProjectPermissionDynamicSecretActions,
+  ProjectPermissionHoneyTokenActions,
+  ProjectPermissionSecretActions,
+  ProjectPermissionSecretRotationActions,
+  ProjectPermissionSet,
+  ProjectPermissionSub
+} from "@app/ee/services/permission/project-permission";
+import { shouldApplyPolicy } from "@app/ee/services/secret-change-policy/secret-change-policy-fns";
+import { TSecretChangePolicyServiceFactory } from "@app/ee/services/secret-change-policy/secret-change-policy-service";
+import { TSecretRotationV2DALFactory } from "@app/ee/services/secret-rotation-v2/secret-rotation-v2-dal";
+import { BadRequestError, InternalServerError, NotFoundError } from "@app/lib/errors";
+
+import { TAdditionalPrivilegeDALFactory } from "../additional-privilege/additional-privilege-dal";
+import { ActorType } from "../auth/auth-type";
+import { TProjectEnvDALFactory } from "../project-env/project-env-dal";
+import { TSecretImportDALFactory } from "../secret-import/secret-import-dal";
+import { TSecretV2BridgeDALFactory } from "../secret-v2-bridge/secret-v2-bridge-dal";
+import { TSecretFolderDALFactory } from "./secret-folder-dal";
+import { TFolderChangeAction, TFolderMoveBlockingType, TFolderRenameScope } from "./secret-folder-types";
+
+export const buildFolderPath = (
+  folder: TSecretFolders,
+  foldersMap: Record<string, TSecretFolders>,
+  depth: number = 0
+): string => {
+  if (depth > 20) {
+    throw new InternalServerError({ message: "Maximum folder depth of 20 exceeded" });
+  }
+  if (!folder.parentId) {
+    return depth === 0 ? "/" : "";
+  }
+
+  const parent = foldersMap[folder.parentId];
+  if (!parent) {
+    // Orphaned folder
+    return `/${folder.name}`;
+  }
+
+  return `${buildFolderPath(parent, foldersMap, depth + 1)}/${folder.name}`;
+};
+
+export const buildFolderIdMap = (folders: TSecretFolders[]): Record<string, TSecretFolders> => {
+  const map: Record<string, TSecretFolders> = {};
+  for (const folder of folders) {
+    map[folder.id] = folder;
+  }
+  return map;
+};
+
+export const buildChildrenMap = <T extends TSecretFolders>(folders: T[]): Record<string, T[]> => {
+  const map: Record<string, T[]> = {};
+  for (const folder of folders) {
+    const key = folder.parentId || "null";
+    if (!map[key]) {
+      map[key] = [];
+    }
+    map[key].push(folder);
+  }
+  return map;
+};
+
+export const resolvePathToFolder = (
+  childrenMap: Record<string, TSecretFolders[]>,
+  pathSegments: string[]
+): TSecretFolders | undefined => {
+  const roots = childrenMap.null || [];
+  const root = roots[0];
+  if (!root) return undefined;
+
+  if (pathSegments.length === 0) return root;
+
+  let current = root;
+  for (const segment of pathSegments) {
+    const children = childrenMap[current.id] || [];
+    const next = children.find((f) => f.name === segment);
+    if (!next) return undefined;
+    current = next;
+  }
+  return current;
+};
+
+export const resolveClosestFolder = (
+  childrenMap: Record<string, TSecretFolders[]>,
+  pathSegments: string[]
+): TSecretFolders | undefined => {
+  const roots = childrenMap.null || [];
+  const root = roots[0];
+  if (!root) return undefined;
+
+  if (pathSegments.length === 0) return root;
+
+  let current = root;
+  for (const segment of pathSegments) {
+    const children = childrenMap[current.id] || [];
+    const next = children.find((f) => f.name === segment);
+    if (!next) return current;
+    current = next;
+  }
+  return current;
+};
+
+// read permission used to decide whether an actor is allowed to learn that a given blocking resource
+// exists at a folder path. used to avoid disclosing subtree contents (e.g. honey tokens) to actors
+// without access while still scanning the full subtree to enforce move correctness. every blocking type
+// except secret_approval_policy (handled explicitly in canActorReadBlock) must have an entry here.
+const FOLDER_MOVE_BLOCK_PERMISSION: Record<
+  Exclude<TFolderMoveBlockingType, "secret_approval_policy">,
+  { action: string; subject: ProjectPermissionSub }
+> = {
+  secret_import: { action: ProjectPermissionActions.Read, subject: ProjectPermissionSub.SecretImports },
+  dynamic_secret: {
+    action: ProjectPermissionDynamicSecretActions.ReadRootCredential,
+    subject: ProjectPermissionSub.DynamicSecrets
+  },
+  honey_token: { action: ProjectPermissionHoneyTokenActions.Read, subject: ProjectPermissionSub.HoneyTokens },
+  secret_rotation: {
+    action: ProjectPermissionSecretRotationActions.Read,
+    subject: ProjectPermissionSub.SecretRotation
+  }
+};
+
+// when set, the move-block scan only reports blocks at paths the actor is allowed to read, so it cannot
+// disclose the existence of blocking resources in a subtree the actor cannot see (used by the read-only
+// eligibility endpoint). the move itself omits this so a block always prevents the move.
+export type TFolderMoveAccessScope = {
+  permission: MongoAbility<ProjectPermissionSet>;
+  environment: string;
+  rootFolderPath: string;
+};
+
+export type TFolderMoveBlock = {
+  blockingType: TFolderMoveBlockingType;
+  // display path shown in error messages: relative to the moved folder for secret-type blocks, absolute
+  // for approval-policy blocks (preserves the original message wording).
+  blockingPath: string;
+  // always absolute; used to gate whether the actor may learn the block exists.
+  blockingAbsPath: string;
+  policyName?: string;
+};
+
+export const canActorReadBlock = (
+  permission: MongoAbility<ProjectPermissionSet>,
+  environment: string,
+  blockingType: TFolderMoveBlockingType,
+  secretPath: string
+) => {
+  // an approval policy blocks at a folder path, and folder read is implied-for-all (folder list/get is not
+  // gated by a Read permission), so its existence is not disclosure-gated on a Read-on-SecretFolders proxy.
+  if (blockingType === "secret_approval_policy") return true;
+
+  const blockPermission = FOLDER_MOVE_BLOCK_PERMISSION[blockingType];
+  if (!blockPermission) {
+    throw new InternalServerError({
+      message: `Unhandled folder move blocking type: ${blockingType}`
+    });
+  }
+
+  const { action, subject: sub } = blockPermission;
+  return (permission as MongoAbility).can(action, subject(sub, { environment, secretPath }));
+};
+
+// absolute path of a subtree folder, re-rooted at `rootFolderPath`; the moved folder itself is "/". when the
+// root is "/", its prefix is dropped so child paths stay "/child" rather than "//child".
+export const buildToAbsPath = (rootFolderPath: string) => (folderPath: string) => {
+  if (folderPath === "/") return rootFolderPath;
+  const prefix = rootFolderPath === "/" ? "" : rootFolderPath;
+  return `${prefix}${folderPath}`;
+};
+
+type TCheckFolderMoveBlockDeps = {
+  secretImportDAL: Pick<TSecretImportDALFactory, "findImportByFolderIds">;
+  dynamicSecretDAL: Pick<TDynamicSecretDALFactory, "find">;
+  honeyTokenDAL: Pick<THoneyTokenDALFactory, "find">;
+  secretRotationV2DAL: Pick<TSecretRotationV2DALFactory, "existsByFolderIds">;
+};
+
+// scans the full subtree for non-static-secret resources (imports, dynamic secrets, honey tokens, rotations)
+// and returns the first one found (or null). only the source subtree contents are scanned (the destination
+// inherits the same contents). pass `accessScope` to limit reporting to paths the actor may read; omit it (the
+// move path) to always detect a block and gate only the resulting message.
+export const checkFolderMoveBlock = async (
+  {
+    subtree,
+    rootFolderPath,
+    accessScope
+  }: {
+    subtree: { id: string; path: string }[];
+    rootFolderPath: string;
+    accessScope?: TFolderMoveAccessScope;
+  },
+  { secretImportDAL, dynamicSecretDAL, honeyTokenDAL, secretRotationV2DAL }: TCheckFolderMoveBlockDeps,
+  tx: Knex
+): Promise<TFolderMoveBlock | null> => {
+  const toAbsPath = buildToAbsPath(rootFolderPath);
+
+  const folderIds = subtree.map((f) => f.id);
+  if (!folderIds.length) return null;
+
+  const pathByFolderId = new Map(subtree.map((f) => [f.id, f.path]));
+  const resolvePath = (folderId: string) => pathByFolderId.get(folderId) ?? rootFolderPath;
+
+  const buildBlock = (blockingType: TFolderMoveBlockingType, folderId: string): TFolderMoveBlock => {
+    const blockingPath = resolvePath(folderId);
+
+    return { blockingType, blockingPath, blockingAbsPath: toAbsPath(blockingPath) };
+  };
+
+  // when scoped, only scan folders whose absolute path the actor may read, so block presence at
+  // inaccessible paths isn't disclosed.
+  const folderIdsForType = (blockingType: TFolderMoveBlockingType) => {
+    if (!accessScope) return folderIds;
+    return folderIds.filter((folderId) =>
+      canActorReadBlock(accessScope.permission, accessScope.environment, blockingType, toAbsPath(resolvePath(folderId)))
+    );
+  };
+
+  const importFolderIds = folderIdsForType("secret_import");
+  if (importFolderIds.length) {
+    const importExists = await secretImportDAL.findImportByFolderIds(importFolderIds, tx);
+    if (importExists) return buildBlock("secret_import", importExists.folderId);
+  }
+
+  const dynamicFolderIds = folderIdsForType("dynamic_secret");
+  if (dynamicFolderIds.length) {
+    const [dynamicSecret] = await dynamicSecretDAL.find({ $in: { folderId: dynamicFolderIds } }, { limit: 1, tx });
+    if (dynamicSecret) return buildBlock("dynamic_secret", dynamicSecret.folderId);
+  }
+
+  const honeyTokenFolderIds = folderIdsForType("honey_token");
+  if (honeyTokenFolderIds.length) {
+    const [honeyToken] = await honeyTokenDAL.find({ $in: { folderId: honeyTokenFolderIds } }, { limit: 1, tx });
+    if (honeyToken?.folderId) return buildBlock("honey_token", honeyToken.folderId);
+  }
+
+  const rotationFolderIds = folderIdsForType("secret_rotation");
+  if (rotationFolderIds.length) {
+    const rotation = await secretRotationV2DAL.existsByFolderIds(rotationFolderIds, tx);
+    if (rotation) return buildBlock("secret_rotation", rotation.folderId);
+  }
+
+  return null;
+};
+
+type TCheckFolderMovePolicyBlockDeps = {
+  secretChangePolicyService: Pick<TSecretChangePolicyServiceFactory, "getSecretApprovalPolicyByPaths">;
+};
+
+// checks whether any folder in the subtree (re-rooted at `rootFolderPath` in `environment`) is governed by a
+// secret approval policy, returning the first blocked path in subtree order (or null). used for both the source
+// paths and the destination paths of a move. pass `accessScope` to limit reporting to paths the actor may read;
+// omit it (the move path) to always detect a block and gate only the resulting message.
+export const checkFolderMovePolicyBlock = async (
+  {
+    subtree,
+    projectId,
+    environment,
+    rootFolderPath
+  }: {
+    subtree: { id: string; path: string }[];
+    projectId: string;
+    environment: string;
+    rootFolderPath: string;
+  },
+  { secretChangePolicyService }: TCheckFolderMovePolicyBlockDeps,
+  tx?: Knex
+): Promise<TFolderMoveBlock | null> => {
+  const toAbsPath = buildToAbsPath(rootFolderPath);
+
+  const subtreeAbsPaths = subtree.map((f) => toAbsPath(f.path));
+
+  const policyByPath = await secretChangePolicyService.getSecretApprovalPolicyByPaths(
+    projectId,
+    environment,
+    subtreeAbsPaths,
+    tx
+  );
+
+  // report the first blocked path in subtree order, matching the previous per-folder behavior.
+  for (const blockedPath of subtreeAbsPaths) {
+    const policy = policyByPath.get(blockedPath);
+    if (policy) {
+      return {
+        blockingType: "secret_approval_policy",
+        blockingPath: blockedPath,
+        blockingAbsPath: blockedPath,
+        policyName: policy.name
+      };
+    }
+  }
+
+  return null;
+};
+
+type TCheckFolderRbacPoliciesDeps = {
+  additionalPrivilegeDAL: Pick<TAdditionalPrivilegeDALFactory, "find">;
+};
+
+export const checkFolderHasRbacPolicies = async (
+  { subtree }: { subtree: { id: string }[] },
+  { additionalPrivilegeDAL }: TCheckFolderRbacPoliciesDeps,
+  tx: Knex
+): Promise<boolean> => {
+  const folderIds = subtree.map((f) => f.id);
+  if (!folderIds.length) return false;
+
+  const [privilege] = await additionalPrivilegeDAL.find({ $in: { folderId: folderIds } }, { limit: 1, tx });
+  return Boolean(privilege);
+};
+
+// throws the appropriate BadRequestError for a detected move block. the full subtree is always scanned to
+// enforce correctness, but the message only reveals the offending path/type when the actor is allowed to read
+// it; otherwise it stays generic so inaccessible subtree contents aren't disclosed.
+export const assertFolderMoveAllowed = (
+  block: TFolderMoveBlock,
+  {
+    permission,
+    environment,
+    folderName,
+    scope
+  }: {
+    permission: MongoAbility<ProjectPermissionSet>;
+    environment: string;
+    folderName: string;
+    scope: "source" | "destination";
+  }
+): never => {
+  const canRead = canActorReadBlock(permission, environment, block.blockingType, block.blockingAbsPath);
+
+  if (block.blockingType === "secret_approval_policy") {
+    if (canRead && scope === "source") {
+      throw new BadRequestError({
+        message: `Cannot move folder '${folderName}'. The folder at path '${block.blockingPath}' is protected by the secret approval policy '${block.policyName}'. Folders governed by a secret approval policy cannot be moved. If you need to move this folder, please disable the secret approval policy for the path '${block.blockingPath}'`,
+        name: "MoveFolderProtectedByPolicy"
+      });
+    }
+    if (canRead) {
+      throw new BadRequestError({
+        message: `Cannot move folder '${folderName}'. The destination path '${block.blockingPath}' is protected by the secret approval policy '${block.policyName}'. Folders cannot be moved into a path governed by a secret approval policy. If you need to move this folder here, please disable the secret approval policy for the path '${block.blockingPath}'`,
+        name: "MoveFolderProtectedByPolicy"
+      });
+    }
+    if (scope === "source") {
+      throw new BadRequestError({
+        message: `Cannot move folder '${folderName}'. It contains resources that cannot be moved. Only folders that contain exclusively static secrets can be moved.`
+      });
+    }
+    throw new BadRequestError({
+      message: `Cannot move folder '${folderName}'. The destination is protected by a secret approval policy and the folder cannot be moved there.`
+    });
+  }
+
+  if (canRead) {
+    throw new BadRequestError({
+      message: `Cannot move folder '${folderName}'. It contains a ${block.blockingType.replace(
+        "_",
+        " "
+      )} at path '${block.blockingPath}'. Only folders that contain exclusively static secrets can be moved.`
+    });
+  }
+  throw new BadRequestError({
+    message: `Cannot move folder '${folderName}'. It contains resources that cannot be moved. Only folders that contain exclusively static secrets can be moved.`
+  });
+};
+
+export type TFolderContent = {
+  secretFolderIds: Set<string>;
+  importFolderIds: Set<string>;
+};
+
+export const findFoldersWithContent = async (
+  folderIds: string[],
+  {
+    secretV2BridgeDAL,
+    secretImportDAL
+  }: {
+    secretV2BridgeDAL: Pick<TSecretV2BridgeDALFactory, "findFolderIdsWithSecrets">;
+    secretImportDAL: Pick<TSecretImportDALFactory, "findFolderIdsWithImports">;
+  },
+  tx: Knex
+): Promise<TFolderContent> => {
+  if (!folderIds.length) return { secretFolderIds: new Set(), importFolderIds: new Set() };
+
+  const secretFolderIds = await secretV2BridgeDAL.findFolderIdsWithSecrets(folderIds, tx);
+  const importFolderIds = await secretImportDAL.findFolderIdsWithImports(folderIds, tx);
+
+  return {
+    secretFolderIds: new Set(secretFolderIds),
+    importFolderIds: new Set(importFolderIds)
+  };
+};
+
+export type TPolicyProtectedFolder = {
+  environment: string;
+  path: string;
+  contentPath: string;
+  policyName: string;
+  protects: "secret" | "secret_import";
+};
+
+// returns the first folder, in `folders` order, that holds secrets or secret imports governed by a change
+// policy that applies to `actor`. `folders` carries absolute paths.
+export const findPolicyProtectedFolder = async (
+  {
+    folders,
+    content,
+    projectId,
+    environment,
+    actor
+  }: {
+    folders: { id: string; path: string; contentPath?: string }[];
+    content: TFolderContent;
+    projectId: string;
+    environment: string;
+    actor: ActorType;
+  },
+  {
+    secretChangePolicyService
+  }: { secretChangePolicyService: Pick<TSecretChangePolicyServiceFactory, "getSecretApprovalPolicyByPaths"> },
+  tx: Knex
+): Promise<TPolicyProtectedFolder | null> => {
+  const candidates = folders.filter(
+    (folder) => content.secretFolderIds.has(folder.id) || content.importFolderIds.has(folder.id)
+  );
+  if (!candidates.length) return null;
+
+  const policyByPath = await secretChangePolicyService.getSecretApprovalPolicyByPaths(
+    projectId,
+    environment,
+    candidates.map((folder) => folder.path),
+    tx
+  );
+
+  for (const folder of candidates) {
+    const policy = policyByPath.get(folder.path);
+    if (shouldApplyPolicy(policy, actor)) {
+      return {
+        environment,
+        path: folder.path,
+        contentPath: folder.contentPath ?? folder.path,
+        policyName: policy.name,
+        protects: content.secretFolderIds.has(folder.id) ? "secret" : "secret_import"
+      };
+    }
+  }
+
+  return null;
+};
+
+type TVisibleProtectedContent = TPolicyProtectedFolder["protects"] | "content";
+
+const PROTECTED_CONTENT_LABEL: Record<TVisibleProtectedContent, string> = {
+  secret: "secrets",
+  secret_import: "secret imports",
+  content: "resources"
+};
+
+const FOLDER_CHANGE_BLOCKED_BY_POLICY: Record<TFolderChangeAction, Record<TVisibleProtectedContent, string>> = {
+  delete: {
+    secret: "DeleteFolderProtectedByPolicy",
+    secret_import: "DeleteFolderImportProtectedByPolicy",
+    content: "DeleteFolderProtectedByPolicy"
+  },
+  rename: {
+    secret: "RenameFolderProtectedByPolicy",
+    secret_import: "RenameFolderImportProtectedByPolicy",
+    content: "RenameFolderProtectedByPolicy"
+  }
+};
+
+const visibleProtectedContent = (
+  { environment, contentPath, protects }: TPolicyProtectedFolder,
+  permission: MongoAbility<ProjectPermissionSet>
+): TVisibleProtectedContent => {
+  const canRead =
+    protects === "secret_import"
+      ? canActorReadBlock(permission, environment, "secret_import", contentPath)
+      : hasSecretReadValueOrDescribePermission(permission, ProjectPermissionSecretActions.DescribeSecret, {
+          environment,
+          secretPath: contentPath
+        });
+
+  return canRead ? protects : "content";
+};
+
+const throwFolderChangeBlockedByPolicy = (
+  action: TFolderChangeAction,
+  { path, policyName }: TPolicyProtectedFolder,
+  visibleContent: TVisibleProtectedContent
+): never => {
+  const label = PROTECTED_CONTENT_LABEL[visibleContent];
+  throw new BadRequestError({
+    message: `You cannot ${action} the selected folder because it contains one or more ${label} that are protected by the change policy "${policyName}" at folder path "${path}". Please remove the ${label} at folder path "${path}" and try again.`,
+    name: FOLDER_CHANGE_BLOCKED_BY_POLICY[action][visibleContent]
+  });
+};
+
+export const assertFolderDeleteAllowed = (
+  protectedFolder: TPolicyProtectedFolder | null,
+  permission: MongoAbility<ProjectPermissionSet>
+) => {
+  if (!protectedFolder) return;
+  throwFolderChangeBlockedByPolicy("delete", protectedFolder, visibleProtectedContent(protectedFolder, permission));
+};
+
+export const assertFolderRenameAllowed = (
+  protectedFolder: TPolicyProtectedFolder | null,
+  scope: TFolderRenameScope,
+  permission: MongoAbility<ProjectPermissionSet>
+) => {
+  if (!protectedFolder) return;
+
+  const visibleContent = visibleProtectedContent(protectedFolder, permission);
+
+  if (scope === "destination") {
+    const { path, policyName } = protectedFolder;
+    throw new BadRequestError({
+      message: `You cannot rename the selected folder because its ${PROTECTED_CONTENT_LABEL[visibleContent]} would move to folder path "${path}", which is protected by the change policy "${policyName}". Choose a different name and try again.`,
+      name: "RenameFolderIntoProtectedPath"
+    });
+  }
+
+  throwFolderChangeBlockedByPolicy("rename", protectedFolder, visibleContent);
+};
+
+export const assertNoOverlappingFolderEntries = (entries: { environment: string; path: string }[]) => {
+  entries.forEach((entry, index) => {
+    const overlapping = entries.find(
+      (other, otherIndex) =>
+        otherIndex !== index &&
+        other.environment === entry.environment &&
+        (other.path === entry.path || entry.path.startsWith(`${other.path}/`))
+    );
+
+    if (overlapping) {
+      throw new BadRequestError({
+        message: `Folder "${entry.path}" overlaps with folder "${overlapping.path}" in environment "${entry.environment}". A batch can rename each folder only once and cannot rename a folder together with its subfolders. Rename them in separate requests.`,
+        name: "UpdateManyFolders"
+      });
+    }
+  });
+};
+
+export const resolveBatchFolderEntries = async <
+  T extends { environment: string; path: string; id: string; name: string }
+>(
+  { projectId, folders }: { projectId: string; folders: T[] },
+  {
+    folderDAL,
+    projectEnvDAL
+  }: {
+    folderDAL: Pick<TSecretFolderDALFactory, "findBySecretPath" | "findOne" | "findSecretPathByFolderIds">;
+    projectEnvDAL: Pick<TProjectEnvDALFactory, "findOne">;
+  },
+  tx: Knex
+) => {
+  const resolved = await Promise.all(
+    folders.map(async (newFolder) => {
+      const { environment, path: secretPath, id } = newFolder;
+
+      const parentFolder = await folderDAL.findBySecretPath(projectId, environment, secretPath, tx);
+      if (!parentFolder) {
+        throw new NotFoundError({
+          message: `Folder with path '${secretPath}' in environment with slug '${environment}' not found`,
+          name: "UpdateManyFolders"
+        });
+      }
+
+      const env = await projectEnvDAL.findOne({ projectId, slug: environment }, tx);
+      if (!env) {
+        throw new NotFoundError({
+          message: `Environment with slug '${environment}' in project with ID '${projectId}' not found`,
+          name: "UpdateManyFolders"
+        });
+      }
+      // now folder api accepts id based change
+      // this is for cli backward compatiability and when cli removes this, we will remove this logic
+      const folder = await folderDAL.findOne(
+        uuidValidate(id)
+          ? { envId: env.id, id, parentId: parentFolder.id }
+          : { envId: env.id, name: id, parentId: parentFolder.id },
+        tx
+      );
+
+      if (!folder) {
+        throw new NotFoundError({
+          message: `Folder with id '${id}' in environment with slug '${env.slug}' not found`,
+          name: "UpdateManyFolders"
+        });
+      }
+
+      return { newFolder, parentFolder, env, folder };
+    })
+  );
+
+  const folderPaths = await folderDAL.findSecretPathByFolderIds(
+    projectId,
+    resolved.map(({ folder }) => folder.id),
+    tx
+  );
+
+  const entries = resolved.map((entry, index) => {
+    const folderPath = folderPaths[index]?.path;
+    if (!folderPath) {
+      throw new NotFoundError({
+        message: `Failed to retrieve path for folder with ID '${entry.folder.id}'`,
+        name: "UpdateManyFolders"
+      });
+    }
+    return { ...entry, folderPath };
+  });
+
+  assertNoOverlappingFolderEntries(
+    entries
+      .filter(({ newFolder, folder }) => newFolder.name !== folder.name)
+      .map(({ env, folderPath }) => ({ environment: env.slug, path: folderPath }))
+  );
+
+  return entries;
+};

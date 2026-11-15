@@ -1,0 +1,198 @@
+import { ChevronDownIcon, PlusIcon } from "lucide-react";
+import { twMerge } from "tailwind-merge";
+
+import {
+  Button,
+  Empty,
+  EmptyContent,
+  EmptyDescription,
+  EmptyHeader,
+  EmptyTitle,
+  Input,
+  Loader,
+  Pagination,
+  Table,
+  TableBody,
+  TableHead,
+  TableHeader,
+  TableRow
+} from "@app/components/v3";
+import { useOrganization } from "@app/context";
+import {
+  getUserTablePreference,
+  PreferenceKey,
+  setUserTablePreference
+} from "@app/helpers/userTablePreferences";
+import { usePagination, useResetPageHelper } from "@app/hooks";
+import { useGetIdentityProjectMemberships } from "@app/hooks/api";
+import { OrderByDirection } from "@app/hooks/api/generic/types";
+import { TListActorProjectMembershipsParams } from "@app/hooks/api/projects/types";
+import { UsePopUpState } from "@app/hooks/usePopUp";
+
+import { IdentityProjectRow } from "./IdentityProjectRow";
+
+type Props = {
+  identityId: string;
+  handlePopUpOpen: (
+    popUpName: keyof UsePopUpState<["removeIdentityFromProject", "addIdentityToProduct"]>,
+    data?: object
+  ) => void;
+};
+
+enum IdentityProjectsOrderBy {
+  Name = "name"
+}
+
+const DEFAULT_PER_PAGE = 20;
+
+export const getIdentityProjectsFirstPageParams = (): TListActorProjectMembershipsParams => ({
+  limit: getUserTablePreference("identityProjectsTable", PreferenceKey.PerPage, DEFAULT_PER_PAGE),
+  offset: 0,
+  orderDirection: OrderByDirection.ASC
+});
+
+export const IdentityProjectsTable = ({ identityId, handlePopUpOpen }: Props) => {
+  const { isSubOrganization } = useOrganization();
+
+  const {
+    search,
+    debouncedSearch,
+    setSearch,
+    setPage,
+    page,
+    perPage,
+    setPerPage,
+    offset,
+    orderDirection,
+    toggleOrderDirection
+  } = usePagination(IdentityProjectsOrderBy.Name, {
+    initPerPage: getUserTablePreference(
+      "identityProjectsTable",
+      PreferenceKey.PerPage,
+      DEFAULT_PER_PAGE
+    )
+  });
+
+  const handlePerPageChange = (newPerPage: number) => {
+    setPerPage(newPerPage);
+    setUserTablePreference("identityProjectsTable", PreferenceKey.PerPage, newPerPage);
+  };
+
+  const projectSearch = debouncedSearch.trim();
+  const { data, isPending, isError } = useGetIdentityProjectMemberships(identityId, {
+    limit: perPage,
+    offset,
+    orderDirection,
+    ...(projectSearch ? { search: projectSearch } : {})
+  });
+  const projectMemberships = data?.identityMemberships ?? [];
+  const totalCount = data?.totalCount ?? 0;
+
+  useResetPageHelper({
+    totalCount,
+    offset,
+    setPage
+  });
+
+  if (isPending) {
+    return (
+      <div className="flex h-40 w-full items-center justify-center">
+        <Loader />
+      </div>
+    );
+  }
+
+  if (isError) {
+    return (
+      <Empty className="border">
+        <EmptyHeader>
+          <EmptyTitle>Could not load products</EmptyTitle>
+          <EmptyDescription>Refresh the page to try again.</EmptyDescription>
+        </EmptyHeader>
+      </Empty>
+    );
+  }
+
+  return (
+    <>
+      <Input
+        className="mb-4"
+        maxLength={255}
+        value={search}
+        onChange={(e) => {
+          setSearch(e.target.value);
+          setPage(1);
+        }}
+        placeholder="Search by project name..."
+      />
+      {projectMemberships.length ? (
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead className="w-1/4">Product</TableHead>
+              <TableHead onClick={toggleOrderDirection} className="w-1/4">
+                Project
+                <ChevronDownIcon
+                  className={twMerge(
+                    orderDirection === OrderByDirection.DESC && "rotate-180",
+                    "transition-transform"
+                  )}
+                />
+              </TableHead>
+              <TableHead>Role</TableHead>
+              <TableHead>Added On</TableHead>
+              <TableHead className="w-5" />
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {projectMemberships.map((membership) => {
+              return (
+                <IdentityProjectRow
+                  key={`identity-project-membership-${membership.id}`}
+                  membership={membership}
+                  handlePopUpOpen={handlePopUpOpen}
+                />
+              );
+            })}
+          </TableBody>
+        </Table>
+      ) : (
+        <Empty className="border">
+          <EmptyHeader>
+            <EmptyTitle>
+              {projectSearch
+                ? "No memberships match this search"
+                : "This machine identity does not have access to any products"}
+            </EmptyTitle>
+            <EmptyDescription>
+              {projectSearch
+                ? "Adjust search filters to view memberships."
+                : "Add this machine identity to a product to give it access."}
+            </EmptyDescription>
+            {!projectSearch && (
+              <EmptyContent>
+                <Button
+                  variant={isSubOrganization ? "sub-org" : "org"}
+                  size="xs"
+                  onClick={() => handlePopUpOpen("addIdentityToProduct")}
+                >
+                  <PlusIcon />
+                  Add to Product
+                </Button>
+              </EmptyContent>
+            )}
+          </EmptyHeader>
+        </Empty>
+      )}
+      {Boolean(projectMemberships.length) && (
+        <Pagination
+          count={totalCount}
+          page={page}
+          perPage={perPage}
+          onChangePage={setPage}
+          onChangePerPage={handlePerPageChange}
+        />
+      )}
+    </>
+  );
+};

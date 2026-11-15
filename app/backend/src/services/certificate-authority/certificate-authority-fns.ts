@@ -1,0 +1,1103 @@
+/* eslint-disable no-nested-ternary */
+import { AsnConvert } from "@peculiar/asn1-schema";
+import { CRLNumber, id_ce_cRLNumber } from "@peculiar/asn1-x509";
+import * as x509 from "@peculiar/x509";
+import RE2 from "re2";
+
+import { PlanFeature, TLicenseService } from "@app/domains/platform/license/ce/module";
+import { EventType } from "@app/ee/services/audit-log/audit-log-types";
+import { KeyStorePrefixes } from "@app/keystore/keystore";
+import { crypto } from "@app/lib/crypto/cryptography";
+import { derivePublicKeyFromSecret, getPqcCrypto, isPqcAlgorithm, PqcCryptoKey } from "@app/lib/crypto/pqc";
+import { DatabaseErrorCode } from "@app/lib/error-codes";
+import {
+  BadRequestError,
+  DatabaseError,
+  ForbiddenRequestError,
+  InternalServerError,
+  NotFoundError
+} from "@app/lib/errors";
+import { pick } from "@app/lib/fn";
+import { logger } from "@app/lib/logger";
+import { ExecutionError, isLockHeldByAnotherOwner } from "@app/lib/red-lock";
+import { ActorType } from "@app/services/auth/auth-type";
+import { getProjectKmsCertificateKeyId } from "@app/services/project/project-fns";
+
+import { CERT_CLOCK_SKEW_MS } from "../certificate-common/certificate-constants";
+import { TCertificateProfileDALFactory } from "../certificate-profile/certificate-profile-dal";
+import { parsePemCertificateChain } from "../certificate/certificate-fns";
+import { CertKeyAlgorithm, CertStatus } from "../certificate/certificate-types";
+import { isExternalCaKeySource } from "./ca-key-source/ca-key-source-fns";
+import type { TCaKeySourceServiceFactory } from "./ca-key-source/ca-key-source-service";
+import { TCaKeyDetails } from "./ca-key-source/ca-key-source-types";
+import { buildLocalCaSigner, TCaCrlParams, TCaSigner } from "./ca-signer";
+import { TCertificateAuthorityDALFactory } from "./certificate-authority-dal";
+import { TCertificateAuthoritySecretDALFactory } from "./certificate-authority-secret-dal";
+import {
+  TBuildIssuedCertificateChainDTO,
+  TDNParts,
+  TGetCaCertChainDTO,
+  TGetCaCertChainsDTO,
+  TGetCaCredentialsDTO,
+  TGetActiveCaCertificateDTO,
+  TGetCaSignerDTO,
+  TRebuildCaCrlDTO
+} from "./internal/internal-certificate-authority-types";
+
+/* eslint-disable no-bitwise */
+export const createSerialNumber = () => {
+  const randomBytes = crypto.randomBytes(20); // 20 bytes = 160 bits
+  randomBytes[0] &= 0x7f; // ensure the first bit is 0
+  return randomBytes.toString("hex");
+};
+
+// on anything short-lived these belong together: backdating the start without pushing out the
+// expiry leaves the certificate rejected as expired by a host whose clock runs ahead of ours
+export const getNotBeforeWithClockSkew = (issuedAt: Date) => new Date(issuedAt.getTime() - CERT_CLOCK_SKEW_MS);
+
+export const assertPathLengthMatchesCa = ({
+  storedPathLength,
+  requestedPathLength,
+  allowNoLimitDefault
+}: {
+  storedPathLength?: number | null;
+  requestedPathLength?: number;
+  // The signing-config install endpoints default to -1, meaning "keep the stored value".
+  allowNoLimitDefault: boolean;
+}) => {
+  const stored = storedPathLength ?? -1;
+  if (stored < 0 || requestedPathLength === undefined || requestedPathLength === stored) return;
+  if (allowNoLimitDefault && requestedPathLength === -1) return;
+  throw new BadRequestError({
+    message: `Path length ${requestedPathLength} doesn't match this CA's current certificate (${stored}). Use ${stored} or leave it out.`
+  });
+};
+
+export const getNotAfterWithClockSkew = (expiresAt: Date) => new Date(expiresAt.getTime() + CERT_CLOCK_SKEW_MS);
+
+export const assertCaInProfileProject = (ca: { projectId: string }, profile: { projectId: string }) => {
+  if (ca.projectId !== profile.projectId) {
+    throw new ForbiddenRequestError({
+      message: "Certificate Authority must belong to the same project as the profile"
+    });
+  }
+};
+
+/**
+ * Create an RFC 4514 Distinguished Name string from parts.
+ * Uses x509 library's Name class to handle all escaping automatically.
+ */
+export const createDistinguishedName = (parts: TDNParts) => {
+  // Build JSON array for x509.Name - the library handles all RFC 4514 escaping
+  const jsonName: Array<{ [type: string]: string[] }> = [];
+
+  if (parts.domainComponents) {
+    for (const dc of [...parts.domainComponents].reverse()) {
+      if (dc) jsonName.push({ DC: [dc] });
+    }
+  }
+  if (parts.country) jsonName.push({ C: [parts.country] });
+  if (parts.organization) jsonName.push({ O: [parts.organization] });
+  if (parts.ou) jsonName.push({ OU: [parts.ou] });
+  if (parts.province) jsonName.push({ ST: [parts.province] });
+  if (parts.commonName) jsonName.push({ CN: [parts.commonName] });
+  if (parts.locality) jsonName.push({ L: [parts.locality] });
+
+  // Create Name object from JSON and convert to properly escaped string
+  const name = new x509.Name(jsonName);
+  return name.toString();
+};
+
+/**
+ * Helper to get the last value of a DN attribute from an x509 Name object.
+ * Returns the last value for backward compatibility with the old parsing behavior
+ * which used loop assignment (last occurrence wins for multi-valued attributes).
+ */
+const getNameField = (name: x509.Name, field: string): string | undefined => {
+  const values = name.getField(field);
+  return values.length > 0 ? values[values.length - 1] : undefined;
+};
+
+const DOMAIN_COMPONENT_RDN_KEYS = new Set(["DC", "0.9.2342.19200300.100.1.25"]);
+
+/**
+ * Reads a DC chain into display order, most specific component first. An RDNSequence is encoded
+ * root-first, so the encoded order is reversed. Reading it any other way would let the same bytes
+ * denote two different domains, and a CSR forwarded to an external CA keeps whatever it encoded.
+ */
+const extractDomainComponentsInDisplayOrder = (name: x509.Name): string[] | undefined => {
+  const domainComponents = name
+    .toJSON()
+    .flatMap((rdn) =>
+      Object.entries(rdn).flatMap(([key, values]) => (DOMAIN_COMPONENT_RDN_KEYS.has(key) ? values : []))
+    );
+
+  if (domainComponents.length === 0) return undefined;
+
+  return domainComponents.reverse();
+};
+
+/**
+ * Extract DN parts directly from an x509 Name object.
+ * This is the preferred method as it uses the library's built-in RFC 4514 parsing.
+ */
+export const extractDnParts = (name: x509.Name): TDNParts => {
+  return {
+    country: getNameField(name, "C"),
+    organization: getNameField(name, "O"),
+    ou: getNameField(name, "OU"),
+    province: getNameField(name, "ST"),
+    commonName: getNameField(name, "CN"),
+    locality: getNameField(name, "L"),
+    domainComponents: extractDomainComponentsInDisplayOrder(name)
+  };
+};
+
+/**
+ * Parse a DN string into its component parts.
+ * Prefer using extractDnParts() with the x509 Name object when available.
+ */
+export const parseDistinguishedName = (dn: string): TDNParts => {
+  // Use the x509 library's Name class to parse the DN string - it handles all RFC 4514 escaping
+  const name = new x509.Name(dn);
+  return extractDnParts(name);
+};
+
+/**
+ * Validates that an imported certificate's subject DN and BasicConstraints
+ * match the CA's stored configuration. Collects all mismatches and throws
+ * a single error listing every discrepancy.
+ */
+export const validateImportedCertificate = (
+  certObj: x509.X509Certificate,
+  caConfig: {
+    commonName: string;
+    organization: string;
+    ou: string;
+    country: string;
+    province: string;
+    locality: string;
+    maxPathLength: number | null;
+  }
+) => {
+  const mismatches: string[] = [];
+
+  const certDn = extractDnParts(certObj.subjectName);
+
+  const dnFieldChecks: { label: string; expected: string; actual: string | undefined }[] = [
+    { label: "Common Name (CN)", expected: caConfig.commonName, actual: certDn.commonName },
+    { label: "Organization (O)", expected: caConfig.organization, actual: certDn.organization },
+    { label: "Organizational Unit (OU)", expected: caConfig.ou, actual: certDn.ou },
+    { label: "Country (C)", expected: caConfig.country, actual: certDn.country },
+    { label: "State/Province (ST)", expected: caConfig.province, actual: certDn.province },
+    { label: "Locality (L)", expected: caConfig.locality, actual: certDn.locality }
+  ];
+
+  for (const check of dnFieldChecks) {
+    if (check.expected && check.expected !== (check.actual ?? "")) {
+      mismatches.push(`${check.label} mismatch (expected '${check.expected}', got '${check.actual || ""}')`);
+    }
+  }
+
+  const basicConstraints = certObj.getExtension(x509.BasicConstraintsExtension);
+
+  if (!basicConstraints || !basicConstraints.ca) {
+    mismatches.push("Certificate is not a CA certificate (BasicConstraints CA flag is not set)");
+  }
+
+  if (caConfig.maxPathLength !== null && caConfig.maxPathLength >= 0 && basicConstraints) {
+    const certPathLength = basicConstraints.pathLength;
+    if (certPathLength === undefined || certPathLength !== caConfig.maxPathLength) {
+      mismatches.push(
+        `Path length mismatch (expected ${caConfig.maxPathLength}, got ${certPathLength === undefined ? "unlimited" : certPathLength})`
+      );
+    }
+  }
+
+  if (mismatches.length > 0) {
+    throw new BadRequestError({
+      message: `Imported certificate does not match CA configuration: ${mismatches.join("; ")}`
+    });
+  }
+};
+
+export const getPublicKeyFingerprint = (cert: x509.X509Certificate) =>
+  crypto.nativeCrypto.createHash("sha256").update(Buffer.from(cert.publicKey.rawData)).digest("hex");
+
+export const hasSamePublicKey = (a: x509.X509Certificate, b: x509.X509Certificate) =>
+  Buffer.from(a.publicKey.rawData).equals(Buffer.from(b.publicKey.rawData));
+
+export const isSameCertificateIdentity = (a: x509.X509Certificate, b: x509.X509Certificate) =>
+  a.subject === b.subject && hasSamePublicKey(a, b);
+
+export const keyAlgorithmToAlgCfg = (keyAlgorithm: CertKeyAlgorithm) => {
+  switch (keyAlgorithm) {
+    case CertKeyAlgorithm.RSA_3072:
+      return {
+        name: "RSASSA-PKCS1-v1_5",
+        hash: "SHA-256",
+        publicExponent: new Uint8Array([1, 0, 1]),
+        modulusLength: 3072
+      };
+    case CertKeyAlgorithm.RSA_4096:
+      return {
+        name: "RSASSA-PKCS1-v1_5",
+        hash: "SHA-256",
+        publicExponent: new Uint8Array([1, 0, 1]),
+        modulusLength: 4096
+      };
+    case CertKeyAlgorithm.ECDSA_P256:
+      return {
+        name: "ECDSA",
+        namedCurve: "P-256",
+        hash: "SHA-256"
+      };
+    case CertKeyAlgorithm.ECDSA_P384:
+      return {
+        name: "ECDSA",
+        namedCurve: "P-384",
+        hash: "SHA-384"
+      };
+    case CertKeyAlgorithm.ECDSA_P521:
+      return {
+        name: "ECDSA",
+        namedCurve: "P-521",
+        hash: "SHA-512"
+      };
+    // PQC: hash/namedCurve set to satisfy the TypeScript union return type; only `name` is used
+    case CertKeyAlgorithm.ML_DSA_44:
+      return { name: "ML-DSA-44", hash: "ML-DSA-44", namedCurve: "ML-DSA-44" };
+    case CertKeyAlgorithm.ML_DSA_65:
+      return { name: "ML-DSA-65", hash: "ML-DSA-65", namedCurve: "ML-DSA-65" };
+    case CertKeyAlgorithm.ML_DSA_87:
+      return { name: "ML-DSA-87", hash: "ML-DSA-87", namedCurve: "ML-DSA-87" };
+    case CertKeyAlgorithm.SLH_DSA_SHA2_128F:
+      return { name: "SLH-DSA-SHA2-128f", hash: "SLH-DSA-SHA2-128f", namedCurve: "SLH-DSA-SHA2-128f" };
+    case CertKeyAlgorithm.SLH_DSA_SHA2_128S:
+      return { name: "SLH-DSA-SHA2-128s", hash: "SLH-DSA-SHA2-128s", namedCurve: "SLH-DSA-SHA2-128s" };
+    case CertKeyAlgorithm.SLH_DSA_SHA2_192F:
+      return { name: "SLH-DSA-SHA2-192f", hash: "SLH-DSA-SHA2-192f", namedCurve: "SLH-DSA-SHA2-192f" };
+    case CertKeyAlgorithm.SLH_DSA_SHA2_192S:
+      return { name: "SLH-DSA-SHA2-192s", hash: "SLH-DSA-SHA2-192s", namedCurve: "SLH-DSA-SHA2-192s" };
+    case CertKeyAlgorithm.SLH_DSA_SHA2_256F:
+      return { name: "SLH-DSA-SHA2-256f", hash: "SLH-DSA-SHA2-256f", namedCurve: "SLH-DSA-SHA2-256f" };
+    case CertKeyAlgorithm.SLH_DSA_SHA2_256S:
+      return { name: "SLH-DSA-SHA2-256s", hash: "SLH-DSA-SHA2-256s", namedCurve: "SLH-DSA-SHA2-256s" };
+    case CertKeyAlgorithm.SLH_DSA_SHAKE_128F:
+      return { name: "SLH-DSA-SHAKE-128f", hash: "SLH-DSA-SHAKE-128f", namedCurve: "SLH-DSA-SHAKE-128f" };
+    case CertKeyAlgorithm.SLH_DSA_SHAKE_128S:
+      return { name: "SLH-DSA-SHAKE-128s", hash: "SLH-DSA-SHAKE-128s", namedCurve: "SLH-DSA-SHAKE-128s" };
+    case CertKeyAlgorithm.SLH_DSA_SHAKE_192F:
+      return { name: "SLH-DSA-SHAKE-192f", hash: "SLH-DSA-SHAKE-192f", namedCurve: "SLH-DSA-SHAKE-192f" };
+    case CertKeyAlgorithm.SLH_DSA_SHAKE_192S:
+      return { name: "SLH-DSA-SHAKE-192s", hash: "SLH-DSA-SHAKE-192s", namedCurve: "SLH-DSA-SHAKE-192s" };
+    case CertKeyAlgorithm.SLH_DSA_SHAKE_256F:
+      return { name: "SLH-DSA-SHAKE-256f", hash: "SLH-DSA-SHAKE-256f", namedCurve: "SLH-DSA-SHAKE-256f" };
+    case CertKeyAlgorithm.SLH_DSA_SHAKE_256S:
+      return { name: "SLH-DSA-SHAKE-256s", hash: "SLH-DSA-SHAKE-256s", namedCurve: "SLH-DSA-SHAKE-256s" };
+    default: {
+      // RSA_2048
+      return {
+        name: "RSASSA-PKCS1-v1_5",
+        hash: "SHA-256",
+        publicExponent: new Uint8Array([1, 0, 1]),
+        modulusLength: 2048
+      };
+    }
+  }
+};
+
+export const signatureAlgorithmToAlgCfg = (signatureAlgorithm: string, keyAlgorithm: CertKeyAlgorithm | string) => {
+  if (signatureAlgorithm.startsWith("ML-DSA-") || signatureAlgorithm.startsWith("SLH-DSA-")) {
+    return { name: signatureAlgorithm, hash: signatureAlgorithm, namedCurve: signatureAlgorithm };
+  }
+
+  if (!signatureAlgorithm || typeof signatureAlgorithm !== "string" || !signatureAlgorithm.includes("-")) {
+    throw new Error(`Invalid signature algorithm format: ${signatureAlgorithm}`);
+  }
+
+  const [keyType, hashType] = signatureAlgorithm.split("-");
+
+  if (!keyType || !hashType) {
+    throw new Error(`Malformed signature algorithm: ${signatureAlgorithm}`);
+  }
+
+  const normalizeHashType = (hash: string) => {
+    const upperHash = hash.toUpperCase();
+
+    if (upperHash === "SHA1" || upperHash === "SHA-1") return "SHA-1";
+
+    if (upperHash === "SHA224" || upperHash === "SHA-224") return "SHA-224";
+    if (upperHash === "SHA256" || upperHash === "SHA-256") return "SHA-256";
+    if (upperHash === "SHA384" || upperHash === "SHA-384") return "SHA-384";
+    if (upperHash === "SHA512" || upperHash === "SHA-512") return "SHA-512";
+
+    if (upperHash === "SHA3224" || upperHash === "SHA3-224") return "SHA3-224";
+    if (upperHash === "SHA3256" || upperHash === "SHA3-256") return "SHA3-256";
+    if (upperHash === "SHA3384" || upperHash === "SHA3-384") return "SHA3-384";
+    if (upperHash === "SHA3512" || upperHash === "SHA3-512") return "SHA3-512";
+
+    throw new Error(`Unsupported hash algorithm: ${hash}`);
+  };
+
+  const normalizedHash = hashType ? normalizeHashType(hashType) : undefined;
+
+  switch (keyType) {
+    case "RSA":
+      return {
+        name: "RSASSA-PKCS1-v1_5",
+        hash: normalizedHash || "SHA-256",
+        publicExponent: new Uint8Array([1, 0, 1]),
+        modulusLength:
+          keyAlgorithm === CertKeyAlgorithm.RSA_4096 ? 4096 : keyAlgorithm === CertKeyAlgorithm.RSA_3072 ? 3072 : 2048
+      };
+    case "ECDSA":
+      // eslint-disable-next-line no-case-declarations
+      const is384Curve =
+        keyAlgorithm === CertKeyAlgorithm.ECDSA_P384 || keyAlgorithm === "EC_secp384r1" || keyAlgorithm === "EC_P384";
+      // eslint-disable-next-line no-case-declarations
+      const is521Curve = keyAlgorithm === "EC_secp521r1" || keyAlgorithm === "EC_P521";
+      // eslint-disable-next-line no-case-declarations
+      let namedCurve: string;
+      if (is521Curve) {
+        namedCurve = "P-521";
+      } else if (is384Curve) {
+        namedCurve = "P-384";
+      } else {
+        namedCurve = "P-256";
+      }
+      return {
+        name: "ECDSA",
+        namedCurve,
+        hash: normalizedHash || (namedCurve === "P-384" ? "SHA-384" : "SHA-256")
+      };
+    default:
+      // Fallback to key algorithm default
+      return keyAlgorithmToAlgCfg(keyAlgorithm as CertKeyAlgorithm);
+  }
+};
+
+/**
+ * Return the public and private key of CA with id [caId]
+ * Note: credentials are returned as crypto.webcrypto.CryptoKey
+ * suitable for use with @peculiar/x509 module
+ *
+ * TODO: Update to get latest CA Secret once support for CA renewal with new key pair is added
+ */
+export const getCaCredentials = async ({
+  caId,
+  certificateAuthorityDAL,
+  certificateAuthoritySecretDAL,
+  projectDAL,
+  kmsService,
+  signatureAlgorithm,
+  prefetched
+}: TGetCaCredentialsDTO) => {
+  const ca = prefetched?.ca ?? (await certificateAuthorityDAL.findByIdWithAssociatedCa(caId));
+  if (!ca?.internalCa?.id) throw new NotFoundError({ message: `Internal CA with ID '${caId}' not found` });
+
+  const caSecret = prefetched?.caSecret ?? (await certificateAuthoritySecretDAL.findOne({ caId }));
+  if (!caSecret) throw new NotFoundError({ message: `CA secret for CA with ID '${caId}' not found` });
+  if (!caSecret.encryptedPrivateKey) {
+    throw new BadRequestError({
+      message: `Certificate authority '${caId}' signs with a key held outside Infisical; its signing key is not available locally.`
+    });
+  }
+
+  // getProjectKmsCertificateKeyId opens a transaction even on its read-only path, so a caller that
+  // already resolved the key skips it. That matters on the OCSP signing path, where the concurrency
+  // cap would otherwise hold one transaction per in-flight signature against a ten-connection pool.
+  const keyId =
+    prefetched?.kmsKeyId ??
+    (await getProjectKmsCertificateKeyId({
+      projectId: ca.projectId,
+      projectDAL,
+      kmsService
+    }));
+
+  const kmsDecryptor = await kmsService.decryptWithKmsKey({
+    kmsId: keyId
+  });
+  const decryptedPrivateKey = await kmsDecryptor({
+    cipherTextBlob: caSecret.encryptedPrivateKey
+  });
+
+  const alg = signatureAlgorithm || keyAlgorithmToAlgCfg(ca.internalCa.keyAlgorithm as CertKeyAlgorithm);
+
+  if (isPqcAlgorithm(ca.internalCa.keyAlgorithm)) {
+    const caKeyAlg = keyAlgorithmToAlgCfg(ca.internalCa.keyAlgorithm as CertKeyAlgorithm);
+    const pqcCrypto = getPqcCrypto();
+    const caPrivateKey = await pqcCrypto.subtle.importKey("pkcs8", decryptedPrivateKey, caKeyAlg, true, ["sign"]);
+    const { raw: pubKeyRaw, spkiDer } = await derivePublicKeyFromSecret(
+      ca.internalCa.keyAlgorithm,
+      (caPrivateKey as InstanceType<typeof PqcCryptoKey>).rawKey
+    );
+    const caPublicKey = new PqcCryptoKey(pubKeyRaw, ca.internalCa.keyAlgorithm, "public", ["verify"], spkiDer);
+
+    return { caSecret, caPrivateKey, caPublicKey };
+  }
+
+  const skObj = crypto.nativeCrypto.createPrivateKey({ key: decryptedPrivateKey, format: "der", type: "pkcs8" });
+  const pkObj = crypto.nativeCrypto.createPublicKey(skObj);
+
+  const caPrivateKey = await crypto.nativeCrypto.subtle.importKey(
+    "pkcs8",
+    skObj.export({ format: "der", type: "pkcs8" }),
+    alg,
+    true,
+    ["sign"]
+  );
+
+  const caPublicKey = await crypto.nativeCrypto.subtle.importKey(
+    "spki",
+    pkObj.export({ format: "der", type: "spki" }),
+    alg,
+    true,
+    ["verify"]
+  );
+
+  return {
+    caSecret,
+    caPrivateKey,
+    caPublicKey
+  };
+};
+
+/**
+ * Return a signer for CA with id [caId] that abstracts over where the signing key lives.
+ * For locally-keyed CAs it decrypts the KMS-stored private key; for CAs whose key lives outside
+ * Infisical (HSM, AWS KMS) it routes signing through that key source. Every issuance / renewal / CRL path uses this so the
+ * call sites never branch on key source.
+ */
+export const getCaSigner = async ({
+  caId,
+  certificateAuthorityDAL,
+  certificateAuthoritySecretDAL,
+  projectDAL,
+  kmsService,
+  caKeySourceService,
+  signatureAlgorithm,
+  prefetched
+}: TGetCaSignerDTO): Promise<{
+  caSecret: Awaited<ReturnType<typeof getCaCredentials>>["caSecret"];
+  signer: TCaSigner;
+}> => {
+  const ca = await certificateAuthorityDAL.findByIdWithAssociatedCa(caId);
+  if (!ca?.internalCa?.id) throw new NotFoundError({ message: `Internal CA with ID '${caId}' not found` });
+
+  const caSecret = await certificateAuthoritySecretDAL.findOne({ caId });
+  if (!caSecret) throw new NotFoundError({ message: `CA secret for CA with ID '${caId}' not found` });
+
+  const keyAlgorithm = ca.internalCa.keyAlgorithm as CertKeyAlgorithm;
+
+  if (isExternalCaKeySource(caSecret.keySource)) {
+    const signer = await caKeySourceService.buildSigner({
+      keySource: caSecret.keySource,
+      projectId: ca.projectId,
+      keyAlgorithm,
+      reference: caSecret,
+      signatureAlgorithm
+    });
+
+    return { caSecret, signer };
+  }
+
+  const { caPrivateKey, caPublicKey } = await getCaCredentials({
+    caId,
+    certificateAuthorityDAL,
+    certificateAuthoritySecretDAL,
+    projectDAL,
+    kmsService,
+    signatureAlgorithm,
+    prefetched: { ca, caSecret, kmsKeyId: prefetched?.kmsKeyId }
+  });
+  const signingAlgorithm = signatureAlgorithm || keyAlgorithmToAlgCfg(keyAlgorithm);
+  const signer = buildLocalCaSigner({ privateKey: caPrivateKey, publicKey: caPublicKey, signingAlgorithm });
+
+  return { caSecret, signer };
+};
+
+/**
+ * Return the list of decrypted pem-encoded certificates and certificate chains
+ * for CA with id [caId].
+ */
+export const getCaCertChains = async ({
+  caId,
+  certificateAuthorityDAL,
+  certificateAuthorityCertDAL,
+  projectDAL,
+  kmsService
+}: TGetCaCertChainsDTO) => {
+  const ca = await certificateAuthorityDAL.findById(caId);
+  if (!ca) throw new NotFoundError({ message: `CA with ID '${caId}' not found` });
+
+  const keyId = await getProjectKmsCertificateKeyId({
+    projectId: ca.projectId,
+    projectDAL,
+    kmsService
+  });
+
+  const kmsDecryptor = await kmsService.decryptWithKmsKey({
+    kmsId: keyId
+  });
+
+  const caCerts = await certificateAuthorityCertDAL.find({ caId: ca.id }, { sort: [["version", "asc"]] });
+
+  const decryptedChains = await Promise.all(
+    caCerts.map(async (caCert) => {
+      const decryptedCaCert = await kmsDecryptor({
+        cipherTextBlob: caCert.encryptedCertificate
+      });
+      const caCertObj = new x509.X509Certificate(decryptedCaCert);
+      const decryptedChain = await kmsDecryptor({
+        cipherTextBlob: caCert.encryptedCertificateChain
+      });
+      return {
+        certificate: caCertObj.toString("pem"),
+        certificateChain: decryptedChain.toString("utf-8"),
+        serialNumber: caCertObj.serialNumber,
+        certId: caCert.id,
+        version: caCert.version
+      };
+    })
+  );
+
+  return decryptedChains;
+};
+
+/**
+ * Return the decrypted pem-encoded certificate and certificate chain
+ * corresponding to CA certificate with id [caCertId].
+ */
+export const getCaCertChain = async ({
+  caCertId,
+  certificateAuthorityDAL,
+  certificateAuthorityCertDAL,
+  projectDAL,
+  kmsService
+}: TGetCaCertChainDTO) => {
+  const caCert = await certificateAuthorityCertDAL.findById(caCertId);
+  if (!caCert) throw new NotFoundError({ message: "CA certificate not found" });
+  const ca = await certificateAuthorityDAL.findById(caCert.caId);
+
+  const keyId = await getProjectKmsCertificateKeyId({
+    projectId: ca.projectId,
+    projectDAL,
+    kmsService
+  });
+
+  const kmsDecryptor = await kmsService.decryptWithKmsKey({
+    kmsId: keyId
+  });
+
+  const decryptedCaCert = await kmsDecryptor({
+    cipherTextBlob: caCert.encryptedCertificate
+  });
+
+  const caCertObj = new x509.X509Certificate(decryptedCaCert);
+
+  const decryptedChain = await kmsDecryptor({
+    cipherTextBlob: caCert.encryptedCertificateChain
+  });
+
+  return {
+    caId: caCert.caId,
+    caCert: caCertObj.toString("pem"),
+    caCertChain: decryptedChain.toString("utf-8"),
+    serialNumber: caCertObj.serialNumber
+  };
+};
+
+const CA_CRL_REBUILD_LOCK_TTL_MS = 4 * 60 * 1000;
+
+const CA_CRL_REBUILD_LOCK_RETRY = { retryCount: 20, retryDelay: 500, retryJitter: 100 };
+
+export const assertCaValidityDates = (notAfter: string, notBefore?: string) => {
+  if (new Date(notAfter) <= new Date()) {
+    throw new BadRequestError({
+      message: `CA notAfter date (${notAfter}) must be in the future`
+    });
+  }
+  if (notBefore && new Date(notAfter) <= new Date(notBefore)) {
+    throw new BadRequestError({
+      message: `CA notAfter date (${notAfter}) must be after its notBefore date (${notBefore})`
+    });
+  }
+};
+
+export const nextCrlNumber = (previousCrlNumber: number) =>
+  Math.max(previousCrlNumber + 1, Math.floor(Date.now() / 1000));
+
+export const buildCaCrlPem = (crl: x509.X509Crl) => {
+  const base64Lines = crl.toString("base64").match(new RE2(".{1,64}", "g"));
+  return `-----BEGIN X509 CRL-----\n${base64Lines?.join("\n")}\n-----END X509 CRL-----`;
+};
+
+export const getCrlNumber = (crl: x509.X509Crl) => {
+  const crlNumberExtension = crl.getExtension(id_ce_cRLNumber);
+  return crlNumberExtension ? Number(AsnConvert.parse(crlNumberExtension.value, CRLNumber).value) : null;
+};
+
+export const isCaCrlAllowed = async ({ orgId, licenseService }: { orgId: string; licenseService: TLicenseService }) => {
+  const plan = await licenseService.getPlan(orgId);
+  return plan.has(PlanFeature.CaCrl);
+};
+
+export const buildCaCrlParams = async ({
+  issuer,
+  caPublicKey,
+  caCertificate,
+  crlNumber,
+  crlValidityDays,
+  caNotAfter,
+  entries
+}: {
+  issuer: string | x509.Name;
+  caPublicKey: CryptoKey;
+  caCertificate?: x509.X509Certificate;
+  crlNumber: number;
+  crlValidityDays: number;
+  caNotAfter?: Date;
+  entries: NonNullable<TCaCrlParams["entries"]>;
+}) => {
+  const thisUpdate = new Date();
+  const validityEnd = new Date(thisUpdate);
+  validityEnd.setDate(validityEnd.getDate() + crlValidityDays);
+  const caSubjectKeyId = caCertificate?.getExtension(x509.SubjectKeyIdentifierExtension)?.keyId;
+  const nextUpdate = caNotAfter && caNotAfter < validityEnd ? caNotAfter : validityEnd;
+  if (nextUpdate <= thisUpdate) {
+    throw new BadRequestError({
+      message: "Failed to regenerate the CRL because the CA certificate has expired. Renew the CA first."
+    });
+  }
+
+  return {
+    issuer,
+    thisUpdate,
+    nextUpdate,
+    entries,
+    extensions: [
+      new x509.Extension(id_ce_cRLNumber, false, AsnConvert.serialize(new CRLNumber(crlNumber))),
+      caSubjectKeyId
+        ? new x509.AuthorityKeyIdentifierExtension(caSubjectKeyId, false)
+        : await x509.AuthorityKeyIdentifierExtension.create(caPublicKey, false)
+    ]
+  };
+};
+
+class CaCrlUpdateInProgressError extends BadRequestError {
+  constructor(message: string) {
+    super({ message });
+  }
+}
+
+const acquireCaCrlRebuildLock = async (caId: string, keyStore: TRebuildCaCrlDTO["keyStore"]) => {
+  try {
+    return await keyStore.acquireLock(
+      [KeyStorePrefixes.CaCrlRebuildLock(caId)],
+      CA_CRL_REBUILD_LOCK_TTL_MS,
+      CA_CRL_REBUILD_LOCK_RETRY
+    );
+  } catch (error) {
+    if (error instanceof ExecutionError && (await isLockHeldByAnotherOwner(error))) {
+      throw new CaCrlUpdateInProgressError("Another CRL update for this CA is still in progress. Try again shortly.");
+    }
+    if (error instanceof ExecutionError) {
+      throw new InternalServerError({
+        message: "Failed to update the CRL because a required service is unavailable. Try again shortly.",
+        error
+      });
+    }
+    throw error;
+  }
+};
+
+export const buildIssuedCertificateChain = async ({
+  caId,
+  caCert,
+  caCertChain,
+  projectId,
+  certificateAuthorityCrossSignedCertDAL,
+  projectDAL,
+  kmsService
+}: TBuildIssuedCertificateChainDTO) => {
+  const defaultChain = `${caCert}\n${caCertChain}`.trim();
+
+  const chainCertObjs = parsePemCertificateChain(defaultChain) ?? [];
+
+  const crossSignedCerts = await certificateAuthorityCrossSignedCertDAL.findValidInCaHierarchy(
+    caId,
+    chainCertObjs.map(getPublicKeyFingerprint)
+  );
+  if (!crossSignedCerts.length) return defaultChain;
+
+  const keyId = await getProjectKmsCertificateKeyId({ projectId, projectDAL, kmsService });
+  const kmsDecryptor = await kmsService.decryptWithKmsKey({ kmsId: keyId });
+
+  const crossSignedCertObjs = await Promise.all(
+    crossSignedCerts.map(async (crossSignedCert) => ({
+      crossSignedCert,
+      certObj: new x509.X509Certificate(await kmsDecryptor({ cipherTextBlob: crossSignedCert.encryptedCertificate }))
+    }))
+  );
+
+  let matchedChainIndex = -1;
+  let match: (typeof crossSignedCertObjs)[number] | undefined;
+  for (let index = 0; index < chainCertObjs.length && !match; index += 1) {
+    match = crossSignedCertObjs.find(({ certObj }) => isSameCertificateIdentity(certObj, chainCertObjs[index]));
+    if (match) matchedChainIndex = index;
+  }
+
+  if (!match) return defaultChain;
+
+  const legacyChain = (
+    await kmsDecryptor({ cipherTextBlob: match.crossSignedCert.encryptedCertificateChain })
+  ).toString("utf-8");
+
+  return [
+    ...chainCertObjs.slice(0, matchedChainIndex).map((chainCertObj) => chainCertObj.toString("pem")),
+    match.certObj.toString("pem"),
+    legacyChain
+  ]
+    .map((pem) => pem.trim())
+    .filter(Boolean)
+    .join("\n");
+};
+
+export const getIssuedCaCertChain = async ({
+  caCertId,
+  projectId,
+  certificateAuthorityDAL,
+  certificateAuthorityCertDAL,
+  certificateAuthorityCrossSignedCertDAL,
+  projectDAL,
+  kmsService
+}: TGetCaCertChainDTO & Omit<TBuildIssuedCertificateChainDTO, "caId" | "caCert" | "caCertChain">) => {
+  const { caId, caCert, caCertChain } = await getCaCertChain({
+    caCertId,
+    certificateAuthorityDAL,
+    certificateAuthorityCertDAL,
+    projectDAL,
+    kmsService
+  });
+
+  const certificateChainPem = await buildIssuedCertificateChain({
+    caId,
+    caCert,
+    caCertChain,
+    projectId,
+    certificateAuthorityCrossSignedCertDAL,
+    projectDAL,
+    kmsService
+  });
+
+  return { caCert, caCertChain, certificateChainPem };
+};
+
+export const getActiveCaCertificate = async ({
+  internalCa,
+  kmsId,
+  certificateAuthorityCertDAL,
+  kmsService,
+  tx
+}: TGetActiveCaCertificateDTO) => {
+  if (!internalCa.activeCaCertId) return undefined;
+
+  const caCert = await certificateAuthorityCertDAL.findById(internalCa.activeCaCertId, tx);
+  if (!caCert) throw new NotFoundError({ message: "CA certificate not found" });
+
+  const kmsDecryptor = await kmsService.decryptWithKmsKey({ kmsId });
+  const decryptedCaCert = await kmsDecryptor({ cipherTextBlob: caCert.encryptedCertificate });
+  return new x509.X509Certificate(decryptedCaCert);
+};
+
+/**
+ * Rebuilds the certificate revocation list (CRL)
+ * for CA with id [caId]
+ */
+export const rebuildCaCrl = async ({
+  caId,
+  certificateAuthorityDAL,
+  certificateAuthorityCertDAL,
+  certificateAuthorityCrlDAL,
+  certificateAuthoritySecretDAL,
+  projectDAL,
+  certificateDAL,
+  kmsService,
+  caKeySourceService,
+  keyStore,
+  auditLogService,
+  trigger,
+  auditLogInfo
+}: TRebuildCaCrlDTO) => {
+  const lock = await acquireCaCrlRebuildLock(caId, keyStore);
+
+  try {
+    const primary = certificateAuthorityCrlDAL.primaryNode();
+
+    const ca = await certificateAuthorityDAL.findByIdWithAssociatedCa(caId, primary);
+    if (!ca?.internalCa?.id) throw new NotFoundError({ message: `Internal CA with ID '${caId}' not found` });
+
+    const { signer } = await getCaSigner({
+      caId: ca.id,
+      certificateAuthorityDAL,
+      certificateAuthoritySecretDAL,
+      projectDAL,
+      kmsService,
+      caKeySourceService
+    });
+
+    const keyId = await getProjectKmsCertificateKeyId({
+      projectId: ca.projectId,
+      projectDAL,
+      kmsService
+    });
+
+    const kmsEncryptor = await kmsService.encryptWithKmsKey({
+      kmsId: keyId
+    });
+
+    const caCertificate = await getActiveCaCertificate({
+      internalCa: ca.internalCa,
+      kmsId: keyId,
+      certificateAuthorityCertDAL,
+      kmsService,
+      tx: primary
+    });
+
+    const caCrl = await certificateAuthorityCrlDAL.findOne({ caId: ca.id }, primary);
+    if (!caCrl) throw new NotFoundError({ message: `CRL for CA with ID '${caId}' not found` });
+
+    const revokedCerts = await certificateDAL.find({ caId: ca.id, status: CertStatus.REVOKED }, { tx: primary });
+
+    const crlNumber = nextCrlNumber(Number(caCrl.crlNumber));
+    const crlParams = await buildCaCrlParams({
+      issuer: caCertificate?.subjectName ?? ca.internalCa.dn,
+      caPublicKey: signer.caPublicKey,
+      caCertificate,
+      crlNumber,
+      crlValidityDays: ca.internalCa.crlValidityDays,
+      caNotAfter: ca.internalCa.notAfter ? new Date(ca.internalCa.notAfter) : undefined,
+      entries: revokedCerts.map((revokedCert) => ({
+        serialNumber: revokedCert.serialNumber,
+        revocationDate: new Date(revokedCert.revokedAt as Date),
+        reason: revokedCert.revocationReason as number
+      }))
+    });
+
+    const crl = await signer.createCrl(crlParams);
+
+    const { cipherTextBlob: encryptedCrl } = await kmsEncryptor({
+      plainText: Buffer.from(new Uint8Array(crl.rawData))
+    });
+
+    const [storedCrl] = await certificateAuthorityCrlDAL.update(
+      { id: caCrl.id, crlNumber: caCrl.crlNumber },
+      {
+        encryptedCrl,
+        thisUpdate: crlParams.thisUpdate,
+        nextUpdate: crlParams.nextUpdate,
+        crlNumber
+      }
+    );
+
+    if (!storedCrl) {
+      throw new CaCrlUpdateInProgressError(
+        `Another request updated the CRL of CA '${ca.name}' at the same time. Try again shortly.`
+      );
+    }
+
+    await auditLogService
+      .createAuditLog({
+        projectId: ca.projectId,
+        ...(auditLogInfo ?? { actor: { type: ActorType.PLATFORM, metadata: {} } }),
+        event: {
+          type: EventType.REGENERATE_CA_CRL,
+          metadata: {
+            caId: ca.id,
+            caName: ca.name,
+            crlId: caCrl.id,
+            crlNumber,
+            thisUpdate: crlParams.thisUpdate.toISOString(),
+            nextUpdate: crlParams.nextUpdate.toISOString(),
+            trigger
+          }
+        }
+      })
+      .catch((error) => {
+        logger.error(error, `Failed to write the CRL regeneration audit log [caId=${caId}]`);
+      });
+
+    return {
+      id: caCrl.id,
+      thisUpdate: crlParams.thisUpdate,
+      nextUpdate: crlParams.nextUpdate,
+      crlNumber,
+      crl: buildCaCrlPem(crl)
+    };
+  } finally {
+    await lock.release().catch((error) => {
+      logger.warn(error, `Failed to release the CRL rebuild lock [caId=${caId}]`);
+    });
+  }
+};
+
+export const getInternalCaExpiredAt = (notAfter?: Date | string | null) => {
+  if (!notAfter) return undefined;
+  const caNotAfter = new Date(notAfter);
+  return caNotAfter <= new Date() ? caNotAfter : undefined;
+};
+
+export const rebuildCaCrlAfterChange = async (
+  dto: TRebuildCaCrlDTO
+): Promise<{ isRegenerated: true } | { isRegenerated: false; reason: string }> => {
+  try {
+    await rebuildCaCrl(dto);
+    return { isRegenerated: true };
+  } catch (error) {
+    logger.error(
+      error,
+      `Failed to rebuild the CRL after a CA change, the hourly CRL rebuild job will retry it [caId=${dto.caId}]`
+    );
+    if (error instanceof CaCrlUpdateInProgressError) {
+      return {
+        isRegenerated: false,
+        reason: "Another CRL update for this CA is in progress. The CRL will be regenerated automatically."
+      };
+    }
+    if (error instanceof BadRequestError || error instanceof NotFoundError || error instanceof InternalServerError) {
+      return { isRegenerated: false, reason: error.message };
+    }
+    return {
+      isRegenerated: false,
+      reason: "Failed to sign the CRL. It will be regenerated automatically once the CA key is reachable."
+    };
+  }
+};
+
+export const expandInternalCa = (
+  ca: Awaited<ReturnType<TCertificateAuthorityDALFactory["findByIdWithAssociatedCa"]>>
+) => {
+  if (!ca.internalCa) {
+    throw new Error("Internal CA must be defined");
+  }
+  return {
+    ...ca.internalCa,
+    ...ca,
+    requireTemplateForIssuance: !ca.enableDirectIssuance
+  } as const;
+};
+
+const TRAILING_SLASHES_REGEX = new RE2("/+$");
+
+// Per RFC 3986 §6.2.2.1 only scheme and host are case-insensitive; path/query/hash are case-sensitive.
+export const normalizeUrlForComparison = (url: string) => {
+  const trimmed = url.trim();
+  try {
+    const parsed = new URL(trimmed);
+    const pathname = parsed.pathname.replace(TRAILING_SLASHES_REGEX, "");
+    return `${parsed.protocol}//${parsed.host}${pathname}${parsed.search}${parsed.hash}`;
+  } catch {
+    return trimmed.replace(TRAILING_SLASHES_REGEX, "").toLowerCase();
+  }
+};
+
+export const buildOcspResponderUrl = (siteUrl: string, caId: string): string =>
+  `${siteUrl}/api/v1/cert-manager/ocsp/${caId}`;
+
+export const buildAuthorityInfoAccessExtension = ({
+  caIssuerUrl,
+  ocspResponderUrl
+}: {
+  caIssuerUrl: string;
+  ocspResponderUrl?: string | null;
+}): x509.AuthorityInfoAccessExtension =>
+  new x509.AuthorityInfoAccessExtension({
+    caIssuers: new x509.GeneralName("url", caIssuerUrl),
+    ...(ocspResponderUrl ? { ocsp: new x509.GeneralName("url", ocspResponderUrl) } : {})
+  });
+
+export const buildCrlDistributionPointUrls = (
+  managedUrl: string,
+  customUrls: string[] | null | undefined,
+  disableManagedUrl?: boolean
+): string[] => {
+  const seen = new Set<string>();
+  const sources = disableManagedUrl ? (customUrls ?? []) : [managedUrl, ...(customUrls ?? [])];
+  return sources.reduce<string[]>((acc, rawUrl) => {
+    if (!rawUrl) return acc;
+    const trimmed = rawUrl.trim();
+    const normalized = normalizeUrlForComparison(trimmed);
+    if (seen.has(normalized)) return acc;
+    seen.add(normalized);
+    acc.push(trimmed);
+    return acc;
+  }, []);
+};
+
+export const assertNoCertificateProfilesUsingCa = async (
+  certificateProfileDAL: Pick<TCertificateProfileDALFactory, "findByCaId">,
+  caId: string,
+  caName: string
+) => {
+  const profiles = await certificateProfileDAL.findByCaId(caId);
+  if (profiles.length > 0) {
+    const profileNames = profiles.map((profile) => profile.slug || profile.id).join(", ");
+
+    throw new BadRequestError({
+      message: `Cannot delete CA '${caName}' as it is currently in use by the following certificate profiles: ${profileNames}. Please remove this CA from these profiles before deleting it.`
+    });
+  }
+};
+
+export const rethrowCaDeleteError = (error: unknown): never => {
+  if (error instanceof DatabaseError) {
+    const { code, constraint } = error.error as { code?: string; constraint?: string };
+    if (code === DatabaseErrorCode.ForeignKeyViolation) {
+      if (constraint === "pki_certificate_profiles_caid_foreign") {
+        throw new BadRequestError({
+          message:
+            "Cannot delete this CA because certificate profiles are associated with it. Delete those certificate profiles first."
+        });
+      }
+      throw new BadRequestError({
+        message: "Cannot delete this CA because it is referenced by another resource"
+      });
+    }
+  }
+  throw error;
+};
+
+const CA_KEY_SOURCE_AUDIT_FIELDS = [
+  "keySource",
+  "hsmConnectorId",
+  "hsmConnectorName",
+  "appConnectionId",
+  "appConnectionName",
+  "externalKeyId",
+  "region"
+] as const;
+
+export const getCaKeySourceAuditMetadata = (configuration: unknown) =>
+  pick((configuration ?? {}) as TCaKeyDetails & { keySource?: string }, [...CA_KEY_SOURCE_AUDIT_FIELDS]);
+
+export const deleteCaAndReleaseExternalKey = async ({
+  caId,
+  certificateAuthorityDAL,
+  certificateAuthoritySecretDAL,
+  caKeySourceService
+}: {
+  caId: string;
+  certificateAuthorityDAL: Pick<TCertificateAuthorityDALFactory, "deleteById">;
+  certificateAuthoritySecretDAL: Pick<TCertificateAuthoritySecretDALFactory, "findOne" | "primaryNode">;
+  caKeySourceService: Pick<TCaKeySourceServiceFactory, "describeKey" | "prepareKeyReleases">;
+}) => {
+  const caSecret = await certificateAuthoritySecretDAL.findOne({ caId }, certificateAuthoritySecretDAL.primaryNode());
+  const keyDetails = await caKeySourceService.describeKey(caSecret);
+  const releaseKeys = await caKeySourceService.prepareKeyReleases(caSecret ? [caSecret] : []);
+
+  await certificateAuthorityDAL.deleteById(caId).catch(rethrowCaDeleteError);
+  await releaseKeys();
+
+  return keyDetails;
+};
