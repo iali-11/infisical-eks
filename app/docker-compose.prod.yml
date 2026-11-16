@@ -9,8 +9,7 @@ services:
         condition: service_healthy
       redis:
         condition: service_started
-    image: infisical:single-stage # infisical/infisical:latest # PIN THIS TO A SPECIFIC TAG
-    # pull_policy: always
+    image: infisical:multi-stage
     env_file: .env
     ports:
       - 8080:8080
