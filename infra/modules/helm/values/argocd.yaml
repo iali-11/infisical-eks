@@ -1,0 +1,22 @@
+configs:
+  params:
+    server.insecure: true
+
+server:
+  service:
+    type: ClusterIP
+
+  ingress:
+    enabled: true
+    ingressClassName: traefik
+
+    annotations:
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+      traefik.ingress.kubernetes.io/router.entrypoints: websecure
+
+    hostname: argocd.infisical.ibrahimali.co.uk
+
+    tls:
+      - secretName: argocd-ingress-tls
+        hosts:
+          - argocd.infisical.ibrahimali.co.uk
