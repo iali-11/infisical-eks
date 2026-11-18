@@ -1,0 +1,247 @@
+variable "project-name" {
+  type    = string
+  default = "infisical-eks"
+}
+
+variable "aws_region" {
+  type    = string
+  default = "eu-west-2"
+}
+
+# VPC values
+
+variable "vpc_cidr_block" {
+  default = "10.0.0.0/20"
+  type    = string
+}
+
+variable "public_subnet_cidr_blocks" {
+  default = ["10.0.0.0/24", "10.0.1.0/24"]
+  type    = list(string)
+}
+
+variable "private_subnet_cidr_blocks" {
+  default = ["10.0.2.0/24", "10.0.3.0/24"]
+  type    = list(string)
+}
+
+variable "availability_zones" {
+  default = ["eu-west-2a", "eu-west-2b"]
+  type    = list(string)
+}
+
+variable "default_cidr_block" {
+  default = "0.0.0.0/0"
+  type    = string
+}
+
+# iam values
+
+variable "cluster_policy_arn" {
+  type    = string
+  default = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
+}
+
+variable "eks_worker_node_policy_arn" {
+  type    = string
+  default = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+}
+
+variable "ecr_registry_policy_arn" {
+  type    = string
+  default = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPullOnly"
+}
+
+variable "cni_policy_arn" {
+  type    = string
+  default = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
+}
+
+variable "hostedzone_id" {
+  type    = string
+  default = "Z08478471FYAILH9V0ZG3"
+}
+
+variable "cert_manager_role_name" {
+  type    = string
+  default = "cert-manager-role"
+}
+
+variable "cert_manager_policy_name" {
+  type    = string
+  default = "cert-manager-policy"
+}
+
+variable "external_dns_role_name" {
+  type    = string
+  default = "external-dns-role"
+}
+
+variable "external_dns_policy_name" {
+  type    = string
+  default = "external-dns-policy"
+}
+
+variable "ebs_csi_policy_arn" {
+  type    = string
+  default = "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"
+}
+
+variable "ebs_csi_role_name" {
+  type    = string
+  default = "ebs_csi_role"
+}
+
+variable "external_secret_role_name" {
+  type    = string
+  default = "external_secret_role"
+}
+
+variable "external_secret_policy_name" {
+  type    = string
+  default = "external_secret_policy"
+}
+
+# EKS Values
+
+variable "cluster-name" {
+  type    = string
+  default = "infisical-eks-cluster"
+}
+
+variable "auth_mode" {
+  type    = string
+  default = "API"
+}
+
+variable "kube_version" {
+  type    = string
+  default = "1.36"
+}
+
+variable "desired_size" {
+  type    = number
+  default = 2
+}
+
+variable "max_size" {
+  type    = number
+  default = 3
+}
+
+variable "min_size" {
+  type    = number
+  default = 2
+}
+
+variable "max_unavailable" {
+  type    = number
+  default = 1
+}
+
+variable "kube-proxy" {
+  type    = string
+  default = "kube-proxy"
+}
+
+variable "vpc-cni" {
+  type    = string
+  default = "vpc-cni"
+}
+
+variable "coredns" {
+  type    = string
+  default = "coredns"
+}
+
+variable "ebs-csi" {
+  type    = string
+  default = "aws-ebs-csi-driver"
+}
+
+variable "pod-identity-agent" {
+  type    = string
+  default = "eks-pod-identity-agent"
+}
+
+variable "public_access_cidrs" {
+  type    = string
+  default = "0.0.0.0/0"
+}
+
+variable "capacity_type" {
+  type    = string
+  default = "SPOT"
+}
+
+variable "disk_size" {
+  type    = number
+  default = 30
+}
+
+variable "disk_type" {
+  type    = string
+  default = "gp3"
+}
+
+variable "instance_types" {
+  type    = string
+  default = "t3.large"
+}
+
+variable "oidc_role_principle_arn" {
+  type    = string
+  default = "arn:aws:iam::050288151438:role/Actions_OIDC_Role"
+}
+
+variable "eks_admin_policy_arn" {
+  type    = string
+  default = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
+}
+
+variable "Ibrahim_principal_arn" {
+  type    = string
+  default = "arn:aws:iam::050288151438:user/Ibrahim"
+}
+
+# RDS Values
+
+variable "engine_version" {
+  type    = string
+  default = "17"
+}
+
+variable "instance_class" {
+  type    = string
+  default = "db.t4g.micro"
+}
+
+variable "allocated_storage" {
+  type    = number
+  default = 20
+}
+
+variable "max_allocated_storage" {
+  type    = number
+  default = 50
+}
+
+variable "db_name" {
+  type    = string
+  default = "infisical"
+}
+
+variable "db_username" {
+  type    = string
+  default = "infisical"
+}
+
+variable "multi_az" {
+  type    = bool
+  default = false
+}
+
+variable "backup_retention_period" {
+  type    = number
+  default = 1
+}
