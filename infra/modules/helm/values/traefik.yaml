@@ -1,0 +1,65 @@
+deployment:
+  replicas: 2
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: traefik
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 256Mi
+
+ingressClass:
+  enabled: true
+  isDefaultClass: true
+  name: traefik
+
+providers:
+  kubernetesIngress:
+    enabled: true
+    publishedService:
+      enabled: true
+  kubernetesCRD:
+    enabled: true
+
+ports:
+  web:
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true
+  websecure:
+    http:
+      tls:
+        enabled: true
+
+service:
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: nlb
+  spec:
+    type: LoadBalancer
+
+metrics:
+  prometheus:
+    serviceMonitor:
+      enabled: true
+      additionalLabels:
+        release: kube-prometheus-stack
+
+log:
+  level: INFO
+accessLog:
+  enabled: true
