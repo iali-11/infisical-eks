@@ -1,0 +1,22 @@
+provider: aws
+
+env:
+- name: AWS_DEFAULT_REGION
+  value: eu-west-2
+
+domainFilters:
+  - infisical.ibrahimali.co.uk
+
+extraArgs:
+  zone-id-filter:
+    - Z08478471FYAILH9V0ZG3
+
+policy: sync
+
+registry: txt
+
+txtOwnerId: infisical-eks
+
+serviceAccount:
+  annotations:
+    eks.amazonaws.com/role-arn: "${external_dns_role_arn}"
