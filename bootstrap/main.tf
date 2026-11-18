@@ -14,7 +14,7 @@ module "s3" {
 }
 
 module "oidc" {
-  source = "./modules/oidc"
+  source         = "./modules/oidc"
   repository_arn = module.ecr.repository_arn
-  bucket_arn = module.s3.bucket_arn
+  bucket_arn     = module.s3.bucket_arn
 }
