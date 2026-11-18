@@ -26,11 +26,11 @@ resource "helm_release" "cert_manager" {
   namespace        = "cert-manager"
 
   values = [
-    templatefile("${path.module}/values/cert-manager.yaml", { 
+    templatefile("${path.module}/values/cert-manager.yaml", {
       cert_manager_role_arn = var.cert_manager_role_arn
-    })]
+  })]
 
-  depends_on = [ 
+  depends_on = [
     var.eks_access_policy_association_arn
   ]
 }
@@ -46,7 +46,7 @@ resource "helm_release" "external_dns" {
   values = [
     templatefile("${path.module}/values/external-dns.yaml", {
       external_dns_role_arn = var.external_dns_role_arn
-    })]
+  })]
 
   depends_on = [
     helm_release.traefik,
@@ -63,7 +63,7 @@ resource "helm_release" "external_secrets" {
   create_namespace = true
   namespace        = "external-secrets"
 
-  depends_on = [ 
+  depends_on = [
     var.eks_access_policy_association_arn
   ]
 }
@@ -76,9 +76,9 @@ resource "helm_release" "reloader" {
   create_namespace = true
   namespace        = "reloader"
 
-  depends_on = [ 
+  depends_on = [
     var.eks_access_policy_association_arn
-   ]
+  ]
 }
 
 resource "helm_release" "argo_cd" {
@@ -94,10 +94,10 @@ resource "helm_release" "argo_cd" {
     file("${path.module}/values/argocd.yaml")
   ]
 
-  depends_on = [ 
+  depends_on = [
     helm_release.traefik,
     var.eks_access_policy_association_arn
-   ]
+  ]
 }
 
 resource "helm_release" "kube_prometheus_stack" {
@@ -117,5 +117,5 @@ resource "helm_release" "kube_prometheus_stack" {
 
   depends_on = [
     var.eks_access_policy_association_arn
-   ]
+  ]
 }
