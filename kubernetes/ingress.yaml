@@ -1,0 +1,27 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: infisical-ingress
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+
+spec:
+  ingressClassName: traefik
+
+  rules:
+    - host: app.infisical.ibrahimali.co.uk
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: infisical-svc
+                port:
+                  number: 80
+
+  tls:
+    - hosts:
+        - app.infisical.ibrahimali.co.uk
+      secretName: app-infisical-tls
