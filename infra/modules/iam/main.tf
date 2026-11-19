@@ -236,7 +236,7 @@ resource "aws_iam_policy" "external_secret_policy" {
           "secretsmanager:DescribeSecret"
         ]
         Effect   = "Allow"
-        Resource = var.db_secret_arn
+        Resource = var.app_secret_arn
       },
     ]
   })
