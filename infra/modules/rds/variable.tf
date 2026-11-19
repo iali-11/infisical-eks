@@ -41,3 +41,7 @@ variable "multi_az" {
 variable "backup_retention_period" {
   type = number
 }
+
+variable "redis_sg_id" {
+  type = string
+}
