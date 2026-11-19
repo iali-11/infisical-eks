@@ -10,6 +10,6 @@ output "db_username" {
   value = aws_db_instance.postgres.username
 }
 
-output "db_secret_arn" {
-  value = aws_secretsmanager_secret.db.arn
+output "app_secret_arn" {
+  value = aws_secretsmanager_secret.infisical_app.arn
 }
