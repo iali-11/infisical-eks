@@ -81,3 +81,23 @@ resource "aws_vpc_security_group_ingress_rule" "rds_to_nodes" {
   ip_protocol                  = "tcp"
   to_port                      = 5432
 }
+
+# Redis Security Group
+
+resource "aws_security_group" "redis_sg" {
+  name   = "${var.project-name}-redis-sg"
+  vpc_id = var.vpc_id
+
+  tags = {
+    Name = "${var.project-name}-redis-sg"
+  }
+}
+
+# Allow EKS nodes to connect to Redis on 6379
+resource "aws_vpc_security_group_ingress_rule" "redis_to_nodes" {
+  security_group_id            = aws_security_group.redis_sg.id
+  referenced_security_group_id = aws_security_group.eks_node_sg.id
+  from_port                    = 6379
+  ip_protocol                  = "tcp"
+  to_port                      = 6379
+}
