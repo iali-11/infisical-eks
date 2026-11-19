@@ -48,5 +48,7 @@ spec:
               name: infisical-app
 
         env:
+          - name: NODE_ENV
+            value: production
           - name: SITE_URL
             value: https://app.infisical.ibrahimali.co.uk
