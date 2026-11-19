@@ -61,7 +61,7 @@ module "iam" {
   ebs_csi_role_name           = var.ebs_csi_role_name
   external_secret_role_name   = var.external_secret_role_name
   external_secret_policy_name = var.external_secret_policy_name
-  db_secret_arn               = module.rds.db_secret_arn
+  app_secret_arn              = module.rds.app_secret_arn
 }
 
 module "sg" {
@@ -85,6 +85,7 @@ module "rds" {
   db_username             = var.db_username
   multi_az                = var.multi_az
   backup_retention_period = var.backup_retention_period
+  redis_sg_id             = module.sg.redis_sg_id
 }
 
 module "helm" {
