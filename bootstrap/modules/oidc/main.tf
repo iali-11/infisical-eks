@@ -99,6 +99,7 @@ resource "aws_iam_role_policy" "github_actions_terraform_policy" {
         Action = [
           "ec2:*",
           "rds:*",
+          "elasticache:*",
           "eks:*",
           "elasticloadbalancing:*",
           "route53:*",
@@ -177,6 +178,14 @@ resource "aws_iam_role_policy" "github_actions_terraform_policy" {
           "iam:CreateServiceLinkedRole"
         ]
         Resource = "arn:aws:iam::*:role/aws-service-role/rds.amazonaws.com/AWSServiceRoleForRDS"
+      },
+      {
+        Sid    = "ElastiCacheServiceLinkedRole"
+        Effect = "Allow"
+        Action = [
+          "iam:CreateServiceLinkedRole"
+        ]
+        Resource = "arn:aws:iam::*:role/aws-service-role/elasticache.amazonaws.com/AWSServiceRoleForElastiCache"
       }
     ]
   })
