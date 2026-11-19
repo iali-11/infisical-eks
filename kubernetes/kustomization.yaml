@@ -8,4 +8,4 @@ resources:
   - external-secret.yaml
 images:
   - name: 050288151438.dkr.ecr.eu-west-2.amazonaws.com/infisical
-    newTag: 15d19a2afa1d2852834b00dc6d81545e01f3f12e
+    newTag: 76cb1939fd703f469efe06d890f741ccddb8a2ee
