@@ -1,0 +1,69 @@
+name: Destroy Infrastructure Workflow
+
+on:
+    workflow_dispatch:
+
+permissions:
+    id-token: write
+    contents: read
+
+concurrency:
+    group: terraform-destroy
+    cancel-in-progress: true
+
+env:
+    AWS_REGION: eu-west-2
+    TF_VERSION: v1.15.1
+    CLUSTER_NAME: infisical-eks-cluster
+
+jobs:
+    destroy:
+        runs-on: ubuntu-latest
+        defaults:
+            run:
+                shell: bash
+                working-directory: ./infra
+
+        steps:
+        - name: Checkout Code
+          uses: actions/checkout@v4
+
+        - name: Configure AWS Credentials
+          uses: aws-actions/configure-aws-credentials@v6
+          with:
+            role-to-assume: ${{ secrets.OIDC_ACTIONS_ROLE }}
+            aws-region: ${{ env.AWS_REGION }}
+
+        - name: Setup Terraform
+          uses: hashicorp/setup-terraform@v4
+          with:
+            terraform_version: ${{ env.TF_VERSION }}
+
+        - name: Terraform Init
+          run: terraform init
+
+        - name: Authenticate Into The Cluster
+          run: |
+            aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ env.CLUSTER_NAME }}
+
+        - name: Delete Infisical Application on Argo CD
+          working-directory: ./argo-cd
+          run: |
+            kubectl delete -f infisical-argo.yaml
+
+        - name: Delete Clusterissuer
+          working-directory: ./cert-manager
+          run: |
+            kubectl delete -f issuer.yaml
+
+        - name: Remove External Secrets
+          run: |
+            kubectl patch externalsecret infisical-db -n apps \
+              --type merge -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true
+
+            helm uninstall external-secrets -n external-secrets
+
+        - name: Terraform Destroy
+          run: terraform destroy -auto-approve
