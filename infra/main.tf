@@ -86,6 +86,7 @@ module "rds" {
   multi_az                = var.multi_az
   backup_retention_period = var.backup_retention_period
   redis_sg_id             = module.sg.redis_sg_id
+  secret_version          = var.secret_version
 }
 
 module "helm" {
