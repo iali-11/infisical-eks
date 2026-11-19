@@ -245,3 +245,8 @@ variable "backup_retention_period" {
   type    = number
   default = 1
 }
+
+variable "secret_version" {
+  type    = number
+  default = 1
+}
