@@ -40,25 +40,59 @@ resource "aws_db_instance" "postgres" {
   }
 }
 
+resource "aws_elasticache_subnet_group" "redis" {
+  name       = "${var.project-name}-redis-subnets"
+  subnet_ids = var.private_subnets_ids
+}
+
+resource "aws_elasticache_cluster" "redis" {
+  cluster_id           = "${var.project-name}-redis"
+  engine               = "redis"
+  node_type            = "cache.t4g.micro"
+  num_cache_nodes      = 1
+  parameter_group_name = "default.redis7"
+  engine_version       = "7.1"
+  port                 = 6379
+  security_group_ids   = [var.redis_sg_id]
+  subnet_group_name    = aws_elasticache_subnet_group.redis.name
+
+  tags = {
+    Name         = "${var.project-name}-redis"
+    project-name = var.project-name
+  }
+}
+
 resource "random_password" "db" {
   length  = 24
   special = false
 }
 
-resource "aws_secretsmanager_secret" "db" {
-  name                    = "infisical/db"
+resource "random_id" "infisical_encryption_key" {
+  byte_length = 16
+}
+
+resource "random_id" "infisical_auth_secret" {
+  byte_length = 32
+}
+
+resource "aws_secretsmanager_secret" "infisical_app" {
+  name                    = "infisical/app"
   recovery_window_in_days = 0
 
   tags = {
-    Name         = "infisical/db"
+    Name         = "infisical/app"
     project-name = var.project-name
   }
 }
 
-resource "aws_secretsmanager_secret_version" "db" {
-  secret_id = aws_secretsmanager_secret.db.id
+resource "aws_secretsmanager_secret_version" "infisical_app" {
+  secret_id = aws_secretsmanager_secret.infisical_app.id
   secret_string = jsonencode({
-    username = var.db_username
-    password = random_password.db.result
+    username          = var.db_username
+    password          = random_password.db.result
+    ENCRYPTION_KEY    = random_id.infisical_encryption_key.hex
+    AUTH_SECRET       = random_id.infisical_auth_secret.b64_std
+    DB_CONNECTION_URI = "postgresql://${var.db_username}:${random_password.db.result}@${aws_db_instance.postgres.address}:5432/${var.db_name}?sslmode=require"
+    REDIS_URL         = "redis://${aws_elasticache_cluster.redis.cache_nodes[0].address}:6379"
   })
 }
