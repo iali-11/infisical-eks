@@ -45,3 +45,7 @@ variable "backup_retention_period" {
 variable "redis_sg_id" {
   type = string
 }
+
+variable "secret_version" {
+  type = number
+}
