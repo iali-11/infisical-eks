@@ -1,0 +1,120 @@
+name: Infrastructure Deployment Workflow
+
+on:
+    push:
+        branches: [main]
+        paths:
+          - "infra/**"
+          - "cert-manager/**"
+    workflow_dispatch:
+
+permissions:
+    id-token: write
+    contents: read
+
+env:
+    AWS_REGION: eu-west-2
+    TF_VERSION: v1.15.1
+    CLUSTER_NAME: infisical-eks-cluster
+
+concurrency:
+    group: terraform-deploy
+    cancel-in-progress: true
+
+jobs:
+    deploy:
+        runs-on: ubuntu-latest
+        defaults:
+            run:
+                shell: bash
+                working-directory: ./infra
+
+        steps:
+        - name: Checkout Code
+          uses: actions/checkout@v4
+
+        - name: Configure AWS Credentials
+          uses: aws-actions/configure-aws-credentials@v6
+          with:
+            role-to-assume: ${{ secrets.OIDC_ACTIONS_ROLE }}
+            aws-region: ${{ env.AWS_REGION }}
+
+        - name: Setup Terraform
+          uses: hashicorp/setup-terraform@v4
+          with:
+            terraform_version: ${{ env.TF_VERSION }}
+
+        - name: Terraform Init
+          run: terraform init
+
+        - name: Terraform Format Check
+          run: terraform fmt -check -recursive
+
+        - name: Terraform Validate
+          run: terraform validate
+
+        - name: Infrastructure Security Scan
+          uses: bridgecrewio/checkov-action@v12
+          with:
+            framework: terraform
+            soft_fail: true
+
+        - name: Terraform Plan
+          run: terraform plan -input=false -out=tfplan
+
+        - name: Terraform Apply
+          run: terraform apply -auto-approve tfplan
+
+        - name: Authenticate into the Cluster
+          run: |
+            aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ env.CLUSTER_NAME }}
+
+        - name: Deploy Clusterissuer in Cluster
+          run: kubectl apply -f issuer.yaml
+          working-directory: ./cert-manager
+
+        - name: Wait for Clusterissuer
+          run: |
+            kubectl wait \
+            --for=condition=Ready \
+            clusterissuer/issuer \
+            --timeout=300s
+
+        - name: Wait For Argo CD TLS Certificate
+          run: |
+            kubectl wait \
+            --namespace argo-cd \
+            --for=condition=Ready \
+            certificate/argocd-ingress-tls \
+            --timeout=5m
+
+        - name: Deploy Infisical Application on Argo CD
+          working-directory: ./argo-cd
+          run: |
+            kubectl apply -f infisical-argo.yaml
+
+        - name: Wait For Infisical Application TLS Certificate
+          run: |
+            kubectl wait \
+            --namespace apps \
+            --for=condition=Ready \
+            certificate/app-infisical-tls \
+            --timeout=5m
+
+        - name: Wait for Infisical Application to sync on Argo CD
+          run: |
+            kubectl wait \
+              --namespace argo-cd \
+              --for=jsonpath='{.status.sync.status}'=Synced \
+              application/apps \
+              --timeout=10m
+
+        - name: Wait for Infisical Application to Become Healthy
+          run: |
+            kubectl wait \
+              --namespace argo-cd \
+              --for=jsonpath='{.status.health.status}'=Healthy \
+              application/apps \
+              --timeout=10m
