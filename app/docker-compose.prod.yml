@@ -9,7 +9,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_started
-    image: infisical:multi-stage
+    image: 050288151438.dkr.ecr.eu-west-2.amazonaws.com/infisical:c9937836
+    pull_policy: always
     env_file: .env
     ports:
       - 8080:8080
