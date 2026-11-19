@@ -92,7 +92,7 @@ resource "aws_secretsmanager_secret_version" "infisical_app" {
     password          = random_password.db.result
     ENCRYPTION_KEY    = random_id.infisical_encryption_key.hex
     AUTH_SECRET       = random_id.infisical_auth_secret.b64_std
-    DB_CONNECTION_URI = "postgresql://${var.db_username}:${random_password.db.result}@${aws_db_instance.postgres.address}:5432/${var.db_name}?sslmode=require"
+    DB_CONNECTION_URI = "postgresql://${var.db_username}:${random_password.db.result}@${aws_db_instance.postgres.address}:5432/${var.db_name}?sslmode=no-verify"
     REDIS_URL         = "redis://${aws_elasticache_cluster.redis.cache_nodes[0].address}:6379"
   })
 }
