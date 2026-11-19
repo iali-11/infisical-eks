@@ -45,19 +45,8 @@ spec:
 
         envFrom:
           - secretRef:
-              name: infisical-db
+              name: infisical-app
 
         env:
-          - name: DB_HOST
-            value: infisical-eks-postgres.cpek2ikksmbo.eu-west-2.rds.amazonaws.com
-          - name: DB_NAME
-            value: infisical
-
-        volumeMounts:
-          - name: infisical-config
-            mountPath: /config
-
-      volumes:
-        - name: infisical-config
-          configMap:
-            name: infisical-config
+          - name: SITE_URL
+            value: https://app.infisical.ibrahimali.co.uk
