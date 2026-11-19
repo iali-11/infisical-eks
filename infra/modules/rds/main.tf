@@ -19,9 +19,10 @@ resource "aws_db_instance" "postgres" {
   storage_type          = "gp3"
   storage_encrypted     = true
 
-  db_name  = var.db_name
-  username = var.db_username
-  password = random_password.db.result
+  db_name             = var.db_name
+  username            = var.db_username
+  password_wo         = ephemeral.random_password.db.result
+  password_wo_version = var.secret_version
 
   db_subnet_group_name   = aws_db_subnet_group.db_subnet_group.name
   vpc_security_group_ids = [var.rds_sg_id]
@@ -66,17 +67,18 @@ resource "aws_elasticache_cluster" "redis" {
   }
 }
 
-resource "random_password" "db" {
+ephemeral "random_password" "db" {
   length  = 24
   special = false
 }
 
-resource "random_id" "infisical_encryption_key" {
-  byte_length = 16
+ephemeral "random_password" "infisical_auth_secret" {
+  length  = 44
+  special = false
 }
 
-resource "random_id" "infisical_auth_secret" {
-  byte_length = 32
+ephemeral "random_password" "infisical_encryption_key" {
+  length = 32
 }
 
 resource "aws_secretsmanager_secret" "infisical_app" {
@@ -91,13 +93,14 @@ resource "aws_secretsmanager_secret" "infisical_app" {
 
 resource "aws_secretsmanager_secret_version" "infisical_app" {
   secret_id = aws_secretsmanager_secret.infisical_app.id
-  secret_string = jsonencode({
+  secret_string_wo = jsonencode({
     username          = var.db_username
-    password          = random_password.db.result
-    ENCRYPTION_KEY    = random_id.infisical_encryption_key.hex
-    AUTH_SECRET       = random_id.infisical_auth_secret.b64_std
-    DB_CONNECTION_URI = "postgresql://${var.db_username}:${random_password.db.result}@${aws_db_instance.postgres.address}:5432/${var.db_name}"
+    password          = ephemeral.random_password.db.result
+    ENCRYPTION_KEY    = substr(sha256(ephemeral.random_password.infisical_encryption_key.result), 0, 32)
+    AUTH_SECRET       = ephemeral.random_password.infisical_auth_secret.result
+    DB_CONNECTION_URI = "postgresql://${var.db_username}:${ephemeral.random_password.db.result}@${aws_db_instance.postgres.address}:5432/${var.db_name}"
     REDIS_URL         = "redis://${aws_elasticache_cluster.redis.cache_nodes[0].address}:6379"
     DB_ROOT_CERT      = base64encode(data.http.rds_ca_bundle.response_body)
   })
+  secret_string_wo_version = var.secret_version
 }
