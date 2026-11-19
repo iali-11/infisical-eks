@@ -79,7 +79,7 @@ jobs:
           run: |
             kubectl wait \
             --for=condition=Ready \
-            clusterissuer/issuer \
+            clusterissuer/letsencrypt-prod \
             --timeout=300s
 
         - name: Wait For Argo CD TLS Certificate
