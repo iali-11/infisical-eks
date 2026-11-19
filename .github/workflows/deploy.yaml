@@ -95,14 +95,6 @@ jobs:
           run: |
             kubectl apply -f infisical-argo.yaml
 
-        - name: Wait For Infisical Application TLS Certificate
-          run: |
-            kubectl wait \
-            --namespace apps \
-            --for=condition=Ready \
-            certificate/app-infisical-tls \
-            --timeout=5m
-
         - name: Wait for Infisical Application to sync on Argo CD
           run: |
             kubectl wait \
@@ -110,6 +102,14 @@ jobs:
               --for=jsonpath='{.status.sync.status}'=Synced \
               application/apps \
               --timeout=10m
+
+        - name: Wait For Infisical Application TLS Certificate
+          run: |
+            kubectl wait \
+            --namespace apps \
+            --for=condition=Ready \
+            certificate/app-infisical-tls \
+            --timeout=5m
 
         - name: Wait for Infisical Application to Become Healthy
           run: |
