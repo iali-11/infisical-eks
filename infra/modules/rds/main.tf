@@ -40,6 +40,10 @@ resource "aws_db_instance" "postgres" {
   }
 }
 
+data "http" "rds_ca_bundle" {
+  url = "https://truststore.pki.rds.amazonaws.com/eu-west-2/eu-west-2-bundle.pem"
+}
+
 resource "aws_elasticache_subnet_group" "redis" {
   name       = "${var.project-name}-redis-subnets"
   subnet_ids = var.private_subnets_ids
@@ -92,7 +96,8 @@ resource "aws_secretsmanager_secret_version" "infisical_app" {
     password          = random_password.db.result
     ENCRYPTION_KEY    = random_id.infisical_encryption_key.hex
     AUTH_SECRET       = random_id.infisical_auth_secret.b64_std
-    DB_CONNECTION_URI = "postgresql://${var.db_username}:${random_password.db.result}@${aws_db_instance.postgres.address}:5432/${var.db_name}?sslmode=no-verify"
+    DB_CONNECTION_URI = "postgresql://${var.db_username}:${random_password.db.result}@${aws_db_instance.postgres.address}:5432/${var.db_name}"
     REDIS_URL         = "redis://${aws_elasticache_cluster.redis.cache_nodes[0].address}:6379"
+    DB_ROOT_CERT      = base64encode(data.http.rds_ca_bundle.response_body)
   })
 }
