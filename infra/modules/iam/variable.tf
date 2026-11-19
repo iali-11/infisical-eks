@@ -58,6 +58,6 @@ variable "external_secret_policy_name" {
   type = string
 }
 
-variable "db_secret_arn" {
+variable "app_secret_arn" {
   type = string
 }
