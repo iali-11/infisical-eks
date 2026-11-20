@@ -38,7 +38,7 @@ spec:
 
       containers:
       - name: infisical
-        image: 050288151438.dkr.ecr.eu-west-2.amazonaws.com/infisical:3a35b1f7
+        image: 050288151438.dkr.ecr.eu-west-2.amazonaws.com/infisical:76cb1939fd703f469efe06d890f741ccddb8a2ee
         imagePullPolicy: Always
         ports:
         - containerPort: 8080
