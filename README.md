@@ -26,8 +26,7 @@ Infisical is a step up from a single-binary app. It needs a database, a cache, a
 
 | Service | URL | Live |
 |---|---|---|
-| Infisical Signup Page | https://app.infisical.ibrahimali.co.uk | ![Infisical signup](images/infisical-signup.png) 
-| Infisical Overview Page | https://app.infisical.ibrahimali.co.uk | ![Infisical overview](images/infisical-overview.png)
+| Infisical Overview | https://app.infisical.ibrahimali.co.uk | https://github.com/user-attachments/assets/635be9ff-fd56-4f02-8e9b-c6f19319693a
 | Argo CD | https://argocd.infisical.ibrahimali.co.uk | ![Argo CD](images/argocd-infisical.png)
 | Grafana | https://grafana.infisical.ibrahimali.co.uk | ![Grafana](images/grafana-infisical.png)
 
