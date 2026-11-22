@@ -121,6 +121,22 @@ kubectl apply -f ../argo-cd/infisical-argo.yaml
 └── README.md
 ```
 
+## Multi-stage build: image size
+
+The Dockerfile uses a multi-stage build. The first stage installs all dependencies and builds the app. The final stage copies in only the built output and production dependencies, so build tools and dev dependencies never ship.
+
+| Build | Disk Usage | Content size |
+|---|---|---|
+| Single-stage | 5.3 GB | 1.27 GB |
+| **Multi-stage** | **1.67 GB** | **268 MB** |
+| **Reduction** | **~68% smaller** | **~79% smaller** |
+
+Content size is roughly what gets pushed to ECR and pulled by each node. A smaller image means:
+
+- **Faster pod start-up.** New nodes and rollouts pull ~1 GB less per image.
+- **Lower ECR storage costs.** Every commit pushes a new tagged image.
+- **Smaller attack surface.** Fewer packages in the final image for Trivy to scan and flag.
+
 ## The stack, layer by layer
 
 ### Application
