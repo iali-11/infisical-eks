@@ -26,9 +26,9 @@ Infisical is a step up from a single-binary app. It needs a database, a cache, a
 
 | Service | URL | Live |
 |---|---|---|
-| Infisical Overview | https://app.infisical.ibrahimali.co.uk | https://github.com/user-attachments/assets/635be9ff-fd56-4f02-8e9b-c6f19319693a
-| Argo CD | https://argocd.infisical.ibrahimali.co.uk | ![Argo CD](images/argocd-infisical.png)
-| Grafana | https://grafana.infisical.ibrahimali.co.uk | ![Grafana](images/grafana-infisical.png)
+| Infisical Overview | https://app.infisical.ibrahimali.co.uk | <video src="https://github.com/user-attachments/assets/635be9ff-fd56-4f02-8e9b-c6f19319693a" controls muted width="100%"></video> |
+| Argo CD | https://argocd.infisical.ibrahimali.co.uk | ![Argo CD](images/argocd-infisical.png) |
+| Grafana | https://grafana.infisical.ibrahimali.co.uk | ![Grafana](images/grafana-infisical.png) |
 
 **I tear the cluster down between sessions so it isn't costing me money while I'm not working on it, so these are only live when the platform is up.**
 
